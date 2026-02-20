@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"sync"
@@ -56,6 +57,7 @@ var errUpstreamProtocol = errors.New("upstream protocol error")
 var errUnknownReplyAddressType = errors.New("unknown reply address type")
 
 var upstreamBackoffCache = newUpstreamBackoffState(upstreamUnavailableBackoff)
+var version string
 
 type upstreamConnectError struct {
 	rep byte
@@ -110,7 +112,12 @@ func main() {
 	upstream := flag.String("upstream", "127.0.0.1:1080", "upstream SOCKS5 proxy address")
 	dialTimeout := flag.Duration("dial-timeout", defaultUpstreamDialTimeout, "timeout for connecting to upstream")
 	clientReadTimeout := flag.Duration("client-handshake-timeout", defaultClientReadTimeout, "timeout for reading SOCKS5 greeting/request from client")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(resolveVersion())
+		return
+	}
 
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
@@ -126,6 +133,17 @@ func main() {
 		}
 		go handle(conn, *upstream, *dialTimeout, *clientReadTimeout)
 	}
+}
+
+func resolveVersion() string {
+	if version != "" {
+		return version
+	}
+	info, ok := debug.ReadBuildInfo()
+	if ok && info != nil && info.Main.Version != "" {
+		return info.Main.Version
+	}
+	return ""
 }
 
 // socks5Target holds the parsed CONNECT request from the client.

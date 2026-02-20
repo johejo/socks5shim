@@ -16,6 +16,18 @@ import (
 
 const testIOTimeout = 2 * time.Second
 
+func TestResolveVersion(t *testing.T) {
+	origVersion := version
+	t.Cleanup(func() {
+		version = origVersion
+	})
+
+	version = "v9.9.9"
+	if got := resolveVersion(); got != "v9.9.9" {
+		t.Fatalf("resolveVersion() = %q, want %q", got, "v9.9.9")
+	}
+}
+
 func TestHandleRejectsWhenNoNoAuthMethod(t *testing.T) {
 	client, _ := startHandleSession(t, "127.0.0.1:9", 100*time.Millisecond, 100*time.Millisecond)
 	writeGreeting(t, client, 0x02)
