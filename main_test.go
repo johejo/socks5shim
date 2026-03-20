@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"strings"
@@ -466,6 +468,297 @@ func setDeadline(t *testing.T, conn net.Conn, timeout time.Duration) {
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		t.Fatalf("SetDeadline: %v", err)
 	}
+}
+
+func TestHandleHTTPConnect(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	// Start a target TCP server that echoes data.
+	targetLn := mustListenLoopback(t, "target")
+	go func() {
+		conn, err := targetLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		io.Copy(conn, conn)
+	}()
+
+	// Start a mock upstream SOCKS5 proxy that connects to the target.
+	upstreamLn := mustListenLoopback(t, "upstream")
+	go func() {
+		for {
+			conn, err := upstreamLn.Accept()
+			if err != nil {
+				return
+			}
+			go serveMockUpstream(conn, targetLn.Addr().String())
+		}
+	}()
+
+	// Start HTTP proxy listener.
+	httpLn := mustListenLoopback(t, "http-proxy")
+	go func() {
+		for {
+			conn, err := httpLn.Accept()
+			if err != nil {
+				return
+			}
+			go handleHTTP(conn, upstreamLn.Addr().String(), 2*time.Second, 2*time.Second)
+		}
+	}()
+
+	// Connect to the HTTP proxy and send a CONNECT request.
+	conn, err := net.DialTimeout("tcp", httpLn.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial HTTP proxy: %v", err)
+	}
+	defer conn.Close()
+	setDeadline(t, conn, testIOTimeout)
+
+	fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", targetLn.Addr().String(), targetLn.Addr().String())
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read CONNECT response: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("unexpected status: %d", resp.StatusCode)
+	}
+
+	// Tunnel is established; send data through.
+	if _, err := conn.Write([]byte("hello")); err != nil {
+		t.Fatalf("write through tunnel: %v", err)
+	}
+	echoed := readN(t, br, 5)
+	if string(echoed) != "hello" {
+		t.Fatalf("unexpected echo: %q", echoed)
+	}
+}
+
+func TestHandleHTTPPlainGET(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	// Start a target HTTP server.
+	targetLn := mustListenLoopback(t, "target")
+	go func() {
+		for {
+			conn, err := targetLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				req, err := http.ReadRequest(br)
+				if err != nil {
+					return
+				}
+				if req.URL.Path != "/test" {
+					fmt.Fprintf(c, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+					return
+				}
+				body := "OK"
+				fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+			}(conn)
+		}
+	}()
+
+	// Start a mock upstream SOCKS5 proxy.
+	upstreamLn := mustListenLoopback(t, "upstream")
+	go func() {
+		for {
+			conn, err := upstreamLn.Accept()
+			if err != nil {
+				return
+			}
+			go serveMockUpstream(conn, "")
+		}
+	}()
+
+	// Start HTTP proxy listener.
+	httpLn := mustListenLoopback(t, "http-proxy")
+	go func() {
+		for {
+			conn, err := httpLn.Accept()
+			if err != nil {
+				return
+			}
+			go handleHTTP(conn, upstreamLn.Addr().String(), 2*time.Second, 2*time.Second)
+		}
+	}()
+
+	// Send a plain HTTP GET through the proxy.
+	conn, err := net.DialTimeout("tcp", httpLn.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial HTTP proxy: %v", err)
+	}
+	defer conn.Close()
+	setDeadline(t, conn, testIOTimeout)
+
+	targetAddr := targetLn.Addr().String()
+	fmt.Fprintf(conn, "GET http://%s/test HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", targetAddr, targetAddr)
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("unexpected status: %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(body) != "OK" {
+		t.Fatalf("unexpected body: %q", body)
+	}
+}
+
+func TestHandleHTTPPlainStripsProxyHeaders(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	// Target server that echoes back received headers.
+	targetLn := mustListenLoopback(t, "target")
+	go func() {
+		for {
+			conn, err := targetLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				req, err := http.ReadRequest(br)
+				if err != nil {
+					return
+				}
+				// Report whether proxy headers were forwarded.
+				hasProxyConn := req.Header.Get("Proxy-Connection")
+				hasProxyAuth := req.Header.Get("Proxy-Authorization")
+				body := fmt.Sprintf("proxy-connection=%q proxy-authorization=%q", hasProxyConn, hasProxyAuth)
+				fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+			}(conn)
+		}
+	}()
+
+	upstreamLn := mustListenLoopback(t, "upstream")
+	go func() {
+		for {
+			conn, err := upstreamLn.Accept()
+			if err != nil {
+				return
+			}
+			go serveMockUpstream(conn, "")
+		}
+	}()
+
+	httpLn := mustListenLoopback(t, "http-proxy")
+	go func() {
+		for {
+			conn, err := httpLn.Accept()
+			if err != nil {
+				return
+			}
+			go handleHTTP(conn, upstreamLn.Addr().String(), 2*time.Second, 2*time.Second)
+		}
+	}()
+
+	conn, err := net.DialTimeout("tcp", httpLn.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial HTTP proxy: %v", err)
+	}
+	defer conn.Close()
+	setDeadline(t, conn, testIOTimeout)
+
+	targetAddr := targetLn.Addr().String()
+	fmt.Fprintf(conn, "GET http://%s/ HTTP/1.1\r\nHost: %s\r\nProxy-Connection: keep-alive\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\nConnection: close\r\n\r\n", targetAddr, targetAddr)
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+	if !strings.Contains(bodyStr, `proxy-connection=""`) {
+		t.Fatalf("Proxy-Connection was not stripped: %s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, `proxy-authorization=""`) {
+		t.Fatalf("Proxy-Authorization was not stripped: %s", bodyStr)
+	}
+}
+
+func TestHandleHTTPRejectsInvalidProto(t *testing.T) {
+	client, server := testClientServer(t)
+	done := make(chan struct{})
+	go func() {
+		handleHTTP(server, "127.0.0.1:9", 100*time.Millisecond, 100*time.Millisecond)
+		close(done)
+	}()
+	setDeadline(t, client, testIOTimeout)
+
+	// Send a request with a bogus protocol version.
+	fmt.Fprintf(client, "GET / HTTP/2.0\r\nHost: example.com\r\n\r\n")
+
+	// The handler should close the connection because proto is not HTTP/1.0 or HTTP/1.1.
+	waitDone(t, done)
+}
+
+// serveMockUpstream is a minimal SOCKS5 server that connects to real targets.
+// If fixedTarget is non-empty, it dials that address regardless of what the
+// client requests (useful for redirecting to a test server).
+func serveMockUpstream(conn net.Conn, fixedTarget string) {
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	// Greeting.
+	hdr := make([]byte, 2)
+	if _, err := io.ReadFull(conn, hdr); err != nil {
+		return
+	}
+	methods := make([]byte, hdr[1])
+	if _, err := io.ReadFull(conn, methods); err != nil {
+		return
+	}
+	conn.Write([]byte{socksVersion, socksMethodNoAuth})
+
+	// CONNECT request.
+	reqHdr := make([]byte, 4)
+	if _, err := io.ReadFull(conn, reqHdr); err != nil {
+		return
+	}
+	target, err := readTarget(conn, reqHdr[3])
+	if err != nil {
+		return
+	}
+
+	dialAddr := target.addr
+	if fixedTarget != "" {
+		dialAddr = fixedTarget
+	}
+
+	remote, err := net.DialTimeout("tcp", dialAddr, 2*time.Second)
+	if err != nil {
+		conn.Write([]byte{socksVersion, socksRepHostUnreachable, socksRSV, socksAtypIPv4, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	defer remote.Close()
+
+	conn.Write([]byte{socksVersion, socksRepSucceeded, socksRSV, socksAtypIPv4, 127, 0, 0, 1, 0, 0})
+	conn.SetDeadline(time.Time{})
+
+	done := make(chan struct{})
+	go func() {
+		io.Copy(remote, conn)
+		close(done)
+	}()
+	io.Copy(conn, remote)
+	<-done
 }
 
 func isPermissionDenied(err error) bool {

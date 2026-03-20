@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/binary"
 	"errors"
 	"flag"
@@ -9,9 +10,11 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"net/url"
 	"runtime/debug"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -109,6 +112,7 @@ func (s *upstreamBackoffState) clear(addr string) {
 
 func main() {
 	listen := flag.String("listen", "127.0.0.1:1081", "listen address")
+	httpListen := flag.String("http-listen", "", "HTTP proxy listen address (empty to disable)")
 	upstream := flag.String("upstream", "127.0.0.1:1080", "upstream SOCKS5 proxy address")
 	dialTimeout := flag.Duration("dial-timeout", defaultUpstreamDialTimeout, "timeout for connecting to upstream")
 	clientReadTimeout := flag.Duration("client-handshake-timeout", defaultClientReadTimeout, "timeout for reading SOCKS5 greeting/request from client")
@@ -119,11 +123,29 @@ func main() {
 		return
 	}
 
+	if *httpListen != "" {
+		httpLn, err := net.Listen("tcp", *httpListen)
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("HTTP proxy listening on %s, upstream %s (timeout %s)", *httpListen, *upstream, *dialTimeout)
+		go func() {
+			for {
+				conn, err := httpLn.Accept()
+				if err != nil {
+					log.Printf("http accept: %v", err)
+					continue
+				}
+				go handleHTTP(conn, *upstream, *dialTimeout, *clientReadTimeout)
+			}
+		}()
+	}
+
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("listening on %s, upstream %s (timeout %s)", *listen, *upstream, *dialTimeout)
+	log.Printf("SOCKS5 listening on %s, upstream %s (timeout %s)", *listen, *upstream, *dialTimeout)
 
 	for {
 		conn, err := ln.Accept()
@@ -484,6 +506,190 @@ func sendReplyWithBind(w io.Writer, rep byte, bind net.Addr) {
 	}
 
 	w.Write([]byte{socksVersion, rep, socksRSV, socksAtypIPv4, 0, 0, 0, 0, 0, 0})
+}
+
+func handleHTTP(client net.Conn, upstream string, dialTimeout, clientReadTimeout time.Duration) {
+	defer client.Close()
+	if clientReadTimeout <= 0 {
+		clientReadTimeout = defaultClientReadTimeout
+	}
+	if err := client.SetReadDeadline(time.Now().Add(clientReadTimeout)); err != nil {
+		return
+	}
+
+	br := bufio.NewReader(client)
+	requestLine, err := br.ReadString('\n')
+	if err != nil {
+		return
+	}
+	requestLine = strings.TrimRight(requestLine, "\r\n")
+
+	parts := strings.SplitN(requestLine, " ", 3)
+	if len(parts) != 3 {
+		return
+	}
+	method, uri, proto := parts[0], parts[1], parts[2]
+
+	// Validate protocol version to prevent header injection.
+	if proto != "HTTP/1.0" && proto != "HTTP/1.1" {
+		return
+	}
+
+	if strings.ToUpper(method) == "CONNECT" {
+		handleHTTPConnect(client, br, uri, proto, upstream, dialTimeout)
+	} else {
+		handleHTTPPlain(client, br, method, uri, proto, upstream, dialTimeout)
+	}
+}
+
+func handleHTTPConnect(client net.Conn, br *bufio.Reader, uri, proto, upstream string, dialTimeout time.Duration) {
+	// Read and discard headers until empty line.
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return
+		}
+		if strings.TrimRight(line, "\r\n") == "" {
+			break
+		}
+	}
+
+	host, port, err := parseHostPort(uri, "443")
+	if err != nil {
+		client.Write([]byte(proto + " 400 Bad Request\r\n\r\n"))
+		return
+	}
+
+	target := buildHTTPTarget(host, port)
+	remote, viaUpstream, err := dial(upstream, target, dialTimeout)
+	if err != nil {
+		log.Printf("HTTP CONNECT FAIL %s: %v", target.addr, err)
+		client.Write([]byte(proto + " 502 Bad Gateway\r\n\r\n"))
+		return
+	}
+	defer remote.Close()
+
+	if viaUpstream {
+		log.Printf("HTTP CONNECT PROXY %s", target.addr)
+	} else {
+		log.Printf("HTTP CONNECT DIRECT %s -> %s", target.addr, remote.RemoteAddr())
+	}
+
+	if err := client.SetReadDeadline(time.Time{}); err != nil {
+		return
+	}
+	client.Write([]byte(proto + " 200 Connection established\r\n\r\n"))
+
+	// Flush any data already buffered by bufio.Reader before relaying.
+	if n := br.Buffered(); n > 0 {
+		buffered, _ := br.Peek(n)
+		if _, err := remote.Write(buffered); err != nil {
+			return
+		}
+		br.Discard(n)
+	}
+
+	relay(client, remote)
+}
+
+func handleHTTPPlain(client net.Conn, br *bufio.Reader, method, uri, proto, upstream string, dialTimeout time.Duration) {
+	u, err := url.Parse(uri)
+	if err != nil || u.Host == "" {
+		client.Write([]byte(proto + " 400 Bad Request\r\n\r\n"))
+		return
+	}
+
+	host, port, err := parseHostPort(u.Host, "80")
+	if err != nil {
+		client.Write([]byte(proto + " 400 Bad Request\r\n\r\n"))
+		return
+	}
+
+	target := buildHTTPTarget(host, port)
+	remote, viaUpstream, err := dial(upstream, target, dialTimeout)
+	if err != nil {
+		log.Printf("HTTP PLAIN FAIL %s: %v", target.addr, err)
+		client.Write([]byte(proto + " 502 Bad Gateway\r\n\r\n"))
+		return
+	}
+	defer remote.Close()
+
+	if viaUpstream {
+		log.Printf("HTTP PLAIN PROXY %s", target.addr)
+	} else {
+		log.Printf("HTTP PLAIN DIRECT %s -> %s", target.addr, remote.RemoteAddr())
+	}
+
+	// Rewrite request line to relative path.
+	path := u.RequestURI()
+	if _, err := fmt.Fprintf(remote, "%s %s %s\r\n", method, path, proto); err != nil {
+		return
+	}
+
+	// Forward headers, removing hop-by-hop Proxy-* headers.
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return
+		}
+		trimmed := strings.TrimRight(line, "\r\n")
+		if trimmed == "" {
+			remote.Write([]byte("\r\n"))
+			break
+		}
+		lower := strings.ToLower(trimmed)
+		if strings.HasPrefix(lower, "proxy-connection:") || strings.HasPrefix(lower, "proxy-authorization:") {
+			continue
+		}
+		remote.Write([]byte(line))
+	}
+
+	if err := client.SetReadDeadline(time.Time{}); err != nil {
+		return
+	}
+
+	// Flush any data already buffered by bufio.Reader before relaying.
+	if n := br.Buffered(); n > 0 {
+		buffered, _ := br.Peek(n)
+		if _, err := remote.Write(buffered); err != nil {
+			return
+		}
+		br.Discard(n)
+	}
+
+	relay(client, remote)
+}
+
+func parseHostPort(hostport, defaultPort string) (string, uint16, error) {
+	host, portStr, err := net.SplitHostPort(hostport)
+	if err != nil {
+		// No port specified; treat whole string as host.
+		host = hostport
+		portStr = defaultPort
+	}
+	p, err := strconv.Atoi(portStr)
+	if err != nil || p <= 0 || p > 65535 {
+		return "", 0, fmt.Errorf("invalid port: %s", portStr)
+	}
+	return host, uint16(p), nil
+}
+
+func buildHTTPTarget(host string, port uint16) socks5Target {
+	t := socks5Target{port: port}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if ip.Is4() {
+			t.atyp = socksAtypIPv4
+		} else {
+			t.atyp = socksAtypIPv6
+		}
+		t.ip = ip
+		t.addr = netip.AddrPortFrom(ip, port).String()
+	} else {
+		t.atyp = socksAtypDomain
+		t.domain = host
+		t.addr = net.JoinHostPort(host, strconv.Itoa(int(port)))
+	}
+	return t
 }
 
 func relay(a, b net.Conn) {
