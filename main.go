@@ -39,6 +39,7 @@ const (
 	socksRepNetworkUnreachable  = 0x03
 	socksRepHostUnreachable     = 0x04
 	socksRepConnectionRefused   = 0x05
+	socksRepTTLExpired          = 0x06
 	socksRepCommandNotSupported = 0x07
 	socksRepAddressTypeNotSupp  = 0x08
 
@@ -48,14 +49,16 @@ const (
 	socksIPv6AddrLen       = 16
 	socksPortLen           = 2
 
-	defaultUpstreamDialTimeout = 2 * time.Second
-	defaultClientReadTimeout   = 5 * time.Second
-	directDialTimeout          = 10 * time.Second
-	upstreamUnavailableBackoff = 3 * time.Second
+	defaultUpstreamDialTimeout    = 2 * time.Second
+	defaultUpstreamConnectTimeout = 7 * time.Second
+	defaultClientReadTimeout      = 5 * time.Second
+	directDialTimeout             = 10 * time.Second
+	upstreamUnavailableBackoff    = 3 * time.Second
 )
 
 var errAddressTypeNotSupported = errors.New("address type not supported")
 var errUpstreamUnavailable = errors.New("upstream unavailable")
+var errUpstreamConnectTimeout = errors.New("upstream CONNECT timed out")
 var errUpstreamProtocol = errors.New("upstream protocol error")
 var errUnknownReplyAddressType = errors.New("unknown reply address type")
 
@@ -68,6 +71,18 @@ type upstreamConnectError struct {
 
 func (e upstreamConnectError) Error() string {
 	return fmt.Sprintf("upstream CONNECT failed: rep=0x%02x", e.rep)
+}
+
+// fallbackEligible reports whether the reply code is a connection failure
+// that may not recur on a direct path, safe to retry. Deliberate rejections
+// (0x02) and capability mismatches (0x07/0x08) are not.
+func (e upstreamConnectError) fallbackEligible() bool {
+	switch e.rep {
+	case socksRepGeneralFailure, socksRepNetworkUnreachable, socksRepHostUnreachable,
+		socksRepConnectionRefused, socksRepTTLExpired:
+		return true
+	}
+	return false
 }
 
 type upstreamBackoffState struct {
@@ -114,7 +129,8 @@ func main() {
 	listen := flag.String("listen", "127.0.0.1:1081", "listen address")
 	httpListen := flag.String("http-listen", "", "HTTP proxy listen address (empty to disable)")
 	upstream := flag.String("upstream", "127.0.0.1:1080", "upstream SOCKS5 proxy address")
-	dialTimeout := flag.Duration("dial-timeout", defaultUpstreamDialTimeout, "timeout for connecting to upstream")
+	dialTimeout := flag.Duration("dial-timeout", defaultUpstreamDialTimeout, "timeout for TCP connect and SOCKS5 greeting to upstream")
+	connectTimeout := flag.Duration("connect-timeout", defaultUpstreamConnectTimeout, "timeout for SOCKS5 CONNECT reply from upstream")
 	clientReadTimeout := flag.Duration("client-handshake-timeout", defaultClientReadTimeout, "timeout for reading SOCKS5 greeting/request from client")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
@@ -136,7 +152,7 @@ func main() {
 					log.Printf("http accept: %v", err)
 					continue
 				}
-				go handleHTTP(conn, *upstream, *dialTimeout, *clientReadTimeout)
+				go handleHTTP(conn, *upstream, *dialTimeout, *connectTimeout, *clientReadTimeout)
 			}
 		}()
 	}
@@ -153,7 +169,7 @@ func main() {
 			log.Printf("accept: %v", err)
 			continue
 		}
-		go handle(conn, *upstream, *dialTimeout, *clientReadTimeout)
+		go handle(conn, *upstream, *dialTimeout, *connectTimeout, *clientReadTimeout)
 	}
 }
 
@@ -177,7 +193,7 @@ type socks5Target struct {
 	addr   string // host:port for dialing
 }
 
-func handle(client net.Conn, upstream string, dialTimeout, clientReadTimeout time.Duration) {
+func handle(client net.Conn, upstream string, dialTimeout, connectTimeout, clientReadTimeout time.Duration) {
 	defer client.Close()
 	if clientReadTimeout <= 0 {
 		clientReadTimeout = defaultClientReadTimeout
@@ -238,7 +254,7 @@ func handle(client net.Conn, upstream string, dialTimeout, clientReadTimeout tim
 	}
 
 	// --- Try upstream, fallback to direct ---
-	remote, viaUpstream, err := dial(upstream, target, dialTimeout)
+	remote, viaUpstream, err := dial(upstream, target, dialTimeout, connectTimeout)
 	if err != nil {
 		log.Printf("FAIL %s: %v", target.addr, err)
 		var upstreamErr upstreamConnectError
@@ -339,23 +355,33 @@ func replyCodeFromDialError(err error) byte {
 }
 
 // dial tries the upstream SOCKS5 proxy first; on failure, connects directly.
-func dial(upstream string, target socks5Target, timeout time.Duration) (net.Conn, bool, error) {
+func dial(upstream string, target socks5Target, helloTimeout, connectTimeout time.Duration) (net.Conn, bool, error) {
 	if upstreamBackoffCache.shouldSkip(upstream, time.Now()) {
-		conn, err := net.DialTimeout("tcp", target.addr, directDialTimeout)
-		if err != nil {
-			return nil, false, err
-		}
-		return conn, false, nil
+		return dialDirect(target)
 	}
 
-	conn, err := dialUpstream(upstream, target, timeout)
+	conn, err := dialUpstream(upstream, target, helloTimeout, connectTimeout)
 	if err == nil {
 		upstreamBackoffCache.clear(upstream)
 		return conn, true, nil
 	}
 	var connectErr upstreamConnectError
-	if errors.As(err, &connectErr) || errors.Is(err, errUpstreamProtocol) {
-		return nil, false, err
+	if errors.As(err, &connectErr) {
+		if !connectErr.fallbackEligible() {
+			return nil, false, err
+		}
+		// The greeting succeeded, so the upstream is alive: fall back
+		// without poisoning the backoff cache.
+		upstreamBackoffCache.clear(upstream)
+		log.Printf("upstream CONNECT failed (rep=0x%02x) for %s; falling back to direct", connectErr.rep, target.addr)
+		return dialDirect(target)
+	}
+	if errors.Is(err, errUpstreamConnectTimeout) {
+		// A timeout says nothing about upstream health; back off so a
+		// wedged upstream doesn't stall every connection for connectTimeout.
+		upstreamBackoffCache.markUnavailable(upstream, time.Now())
+		log.Printf("upstream CONNECT timed out for %s; falling back to direct", target.addr)
+		return dialDirect(target)
 	}
 	if !errors.Is(err, errUpstreamUnavailable) {
 		return nil, false, err
@@ -363,7 +389,11 @@ func dial(upstream string, target socks5Target, timeout time.Duration) (net.Conn
 
 	upstreamBackoffCache.markUnavailable(upstream, time.Now())
 	log.Printf("upstream unavailable: %v; falling back to direct", err)
-	conn, err = net.DialTimeout("tcp", target.addr, directDialTimeout)
+	return dialDirect(target)
+}
+
+func dialDirect(target socks5Target) (net.Conn, bool, error) {
+	conn, err := net.DialTimeout("tcp", target.addr, directDialTimeout)
 	if err != nil {
 		return nil, false, err
 	}
@@ -371,11 +401,16 @@ func dial(upstream string, target socks5Target, timeout time.Duration) (net.Conn
 }
 
 // dialUpstream performs a full SOCKS5 handshake with the upstream proxy.
-func dialUpstream(addr string, target socks5Target, timeout time.Duration) (net.Conn, error) {
-	if timeout <= 0 {
-		timeout = defaultUpstreamDialTimeout
+// helloTimeout covers TCP connect + greeting; connectTimeout covers the
+// CONNECT request/reply (includes the upstream-side dial to the target).
+func dialUpstream(addr string, target socks5Target, helloTimeout, connectTimeout time.Duration) (net.Conn, error) {
+	if helloTimeout <= 0 {
+		helloTimeout = defaultUpstreamDialTimeout
 	}
-	conn, err := net.DialTimeout("tcp", addr, timeout)
+	if connectTimeout <= 0 {
+		connectTimeout = defaultUpstreamConnectTimeout
+	}
+	conn, err := net.DialTimeout("tcp", addr, helloTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errUpstreamUnavailable, err)
 	}
@@ -385,7 +420,7 @@ func dialUpstream(addr string, target socks5Target, timeout time.Duration) (net.
 			conn.Close()
 		}
 	}()
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(helloTimeout)); err != nil {
 		return nil, fmt.Errorf("%w: %v", errUpstreamUnavailable, err)
 	}
 
@@ -401,15 +436,20 @@ func dialUpstream(addr string, target socks5Target, timeout time.Duration) (net.
 		return nil, fmt.Errorf("%w: auth response %x %x", errUpstreamProtocol, resp[0], resp[1])
 	}
 
+	// The CONNECT reply waits on the upstream-side dial, so it gets its own deadline.
+	if err := conn.SetDeadline(time.Now().Add(connectTimeout)); err != nil {
+		return nil, fmt.Errorf("%w: %v", errUpstreamUnavailable, err)
+	}
+
 	// CONNECT request
 	if _, err := conn.Write(buildConnectRequest(target)); err != nil {
-		return nil, fmt.Errorf("%w: %v", errUpstreamUnavailable, err)
+		return nil, classifyConnectPhaseErr(err)
 	}
 
 	// Read reply header
 	reply := make([]byte, socksConnectHeaderLen)
 	if _, err := io.ReadFull(conn, reply); err != nil {
-		return nil, fmt.Errorf("%w: %v", errUpstreamUnavailable, err)
+		return nil, classifyConnectPhaseErr(err)
 	}
 	if reply[0] != socksVersion || reply[2] != socksRSV {
 		return nil, fmt.Errorf("%w: reply header ver=0x%02x rsv=0x%02x", errUpstreamProtocol, reply[0], reply[2])
@@ -421,13 +461,24 @@ func dialUpstream(addr string, target socks5Target, timeout time.Duration) (net.
 		if errors.Is(err, errUnknownReplyAddressType) {
 			return nil, fmt.Errorf("%w: %v", errUpstreamProtocol, err)
 		}
-		return nil, fmt.Errorf("%w: %v", errUpstreamUnavailable, err)
+		return nil, classifyConnectPhaseErr(err)
 	}
 
 	// Success. Zero value of time.Time means no deadline.
 	conn.SetDeadline(time.Time{})
 	ok = true
 	return conn, nil
+}
+
+// classifyConnectPhaseErr separates a CONNECT reply timeout from the upstream
+// dying mid-handshake. Both end up backoff-cached, but the timeout gets its
+// own error so dial can log it distinctly.
+func classifyConnectPhaseErr(err error) error {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return fmt.Errorf("%w: %v", errUpstreamConnectTimeout, err)
+	}
+	return fmt.Errorf("%w: %v", errUpstreamUnavailable, err)
 }
 
 func buildConnectRequest(t socks5Target) []byte {
@@ -508,7 +559,7 @@ func sendReplyWithBind(w io.Writer, rep byte, bind net.Addr) {
 	w.Write([]byte{socksVersion, rep, socksRSV, socksAtypIPv4, 0, 0, 0, 0, 0, 0})
 }
 
-func handleHTTP(client net.Conn, upstream string, dialTimeout, clientReadTimeout time.Duration) {
+func handleHTTP(client net.Conn, upstream string, dialTimeout, connectTimeout, clientReadTimeout time.Duration) {
 	defer client.Close()
 	if clientReadTimeout <= 0 {
 		clientReadTimeout = defaultClientReadTimeout
@@ -536,13 +587,13 @@ func handleHTTP(client net.Conn, upstream string, dialTimeout, clientReadTimeout
 	}
 
 	if strings.ToUpper(method) == "CONNECT" {
-		handleHTTPConnect(client, br, uri, proto, upstream, dialTimeout)
+		handleHTTPConnect(client, br, uri, proto, upstream, dialTimeout, connectTimeout)
 	} else {
-		handleHTTPPlain(client, br, method, uri, proto, upstream, dialTimeout)
+		handleHTTPPlain(client, br, method, uri, proto, upstream, dialTimeout, connectTimeout)
 	}
 }
 
-func handleHTTPConnect(client net.Conn, br *bufio.Reader, uri, proto, upstream string, dialTimeout time.Duration) {
+func handleHTTPConnect(client net.Conn, br *bufio.Reader, uri, proto, upstream string, dialTimeout, connectTimeout time.Duration) {
 	// Read and discard headers until empty line.
 	for {
 		line, err := br.ReadString('\n')
@@ -561,7 +612,7 @@ func handleHTTPConnect(client net.Conn, br *bufio.Reader, uri, proto, upstream s
 	}
 
 	target := buildHTTPTarget(host, port)
-	remote, viaUpstream, err := dial(upstream, target, dialTimeout)
+	remote, viaUpstream, err := dial(upstream, target, dialTimeout, connectTimeout)
 	if err != nil {
 		log.Printf("HTTP CONNECT FAIL %s: %v", target.addr, err)
 		client.Write([]byte(proto + " 502 Bad Gateway\r\n\r\n"))
@@ -592,7 +643,7 @@ func handleHTTPConnect(client net.Conn, br *bufio.Reader, uri, proto, upstream s
 	relay(client, remote)
 }
 
-func handleHTTPPlain(client net.Conn, br *bufio.Reader, method, uri, proto, upstream string, dialTimeout time.Duration) {
+func handleHTTPPlain(client net.Conn, br *bufio.Reader, method, uri, proto, upstream string, dialTimeout, connectTimeout time.Duration) {
 	u, err := url.Parse(uri)
 	if err != nil || u.Host == "" {
 		client.Write([]byte(proto + " 400 Bad Request\r\n\r\n"))
@@ -606,7 +657,7 @@ func handleHTTPPlain(client net.Conn, br *bufio.Reader, method, uri, proto, upst
 	}
 
 	target := buildHTTPTarget(host, port)
-	remote, viaUpstream, err := dial(upstream, target, dialTimeout)
+	remote, viaUpstream, err := dial(upstream, target, dialTimeout, connectTimeout)
 	if err != nil {
 		log.Printf("HTTP PLAIN FAIL %s: %v", target.addr, err)
 		client.Write([]byte(proto + " 502 Bad Gateway\r\n\r\n"))

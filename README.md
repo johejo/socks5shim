@@ -34,15 +34,16 @@ Default values:
 
 - `-listen`: `127.0.0.1:1081`
 - `-upstream`: `127.0.0.1:1080`
-- `-dial-timeout`: `2s` (timeout for connecting to upstream)
+- `-dial-timeout`: `2s` (TCP connect + SOCKS5 greeting to upstream)
+- `-connect-timeout`: `7s` (SOCKS5 CONNECT reply from upstream)
 - `-client-handshake-timeout`: `5s` (timeout for reading client greeting/request)
 
 ## Behavior Details
 
 - If upstream SOCKS5 is available, traffic is relayed through upstream.
-- If upstream is unreachable (for example connection refused or timeout), the shim falls back to direct TCP dialing.
-- If upstream responds with a valid SOCKS5 error reply (policy/auth/protocol-level failure), the shim returns that error to the client and does not bypass upstream.
-- Unavailable upstream endpoints are backoff-cached for a short period (currently 3 seconds) to avoid repeated slow failures.
+- If upstream is unreachable, or its CONNECT reply times out, the shim falls back to direct TCP dialing and backoff-caches the upstream for a short period (currently 3 seconds).
+- If upstream reports its connection attempt to the target failed (CONNECT reply `0x01`/`0x03`/`0x04`/`0x05`/`0x06`), only that connection falls back to direct; no backoff. These failures may depend on the upstream's network vantage point (e.g. a firewall near the upstream, split DNS), so a direct attempt can still succeed.
+- Deliberate rejections and capability mismatches (`0x02` ruleset, `0x07`/`0x08`) are returned to the client without bypassing upstream.
 
 ## Testing
 

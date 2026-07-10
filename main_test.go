@@ -134,7 +134,7 @@ func TestDialUpstreamRejectsInvalidReplyHeader(t *testing.T) {
 		serverErr <- nil
 	}()
 
-	_, err := dialUpstream(ln.Addr().String(), target, 2*time.Second)
+	_, err := dialUpstream(ln.Addr().String(), target, 2*time.Second, 2*time.Second)
 	if err == nil || !errors.Is(err, errUpstreamProtocol) || !strings.Contains(err.Error(), "reply header") {
 		t.Fatalf("expected upstream reply header error, got: %v", err)
 	}
@@ -159,17 +159,7 @@ func TestDialDoesNotFallbackOnUpstreamConnectFailure(t *testing.T) {
 		}
 	}()
 
-	targetTCPAddr, ok := targetLn.Addr().(*net.TCPAddr)
-	if !ok {
-		t.Fatalf("expected *net.TCPAddr, got %T", targetLn.Addr())
-	}
-	targetAddrPort := targetTCPAddr.AddrPort()
-	target := socks5Target{
-		atyp: socksAtypIPv4,
-		ip:   targetAddrPort.Addr().Unmap(),
-		port: targetAddrPort.Port(),
-		addr: targetAddrPort.String(),
-	}
+	target := targetFromListener(t, targetLn)
 
 	serverErr := make(chan error, 1)
 	go func() {
@@ -193,7 +183,7 @@ func TestDialDoesNotFallbackOnUpstreamConnectFailure(t *testing.T) {
 		serverErr <- nil
 	}()
 
-	conn, viaUpstream, err := dial(upstreamLn.Addr().String(), target, 200*time.Millisecond)
+	conn, viaUpstream, err := dial(upstreamLn.Addr().String(), target, 200*time.Millisecond, 200*time.Millisecond)
 	if conn != nil {
 		conn.Close()
 		t.Fatalf("expected nil conn on upstream policy failure")
@@ -213,6 +203,188 @@ func TestDialDoesNotFallbackOnUpstreamConnectFailure(t *testing.T) {
 	case <-accepted:
 		t.Fatal("direct fallback occurred unexpectedly")
 	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+func TestDialFallsBackOnUpstreamDialFailure(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	tests := []struct {
+		name string
+		rep  byte
+	}{
+		{name: "general failure", rep: socksRepGeneralFailure},
+		{name: "network unreachable", rep: socksRepNetworkUnreachable},
+		{name: "host unreachable", rep: socksRepHostUnreachable},
+		{name: "connection refused", rep: socksRepConnectionRefused},
+		{name: "ttl expired", rep: socksRepTTLExpired},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			upstreamLn := mustListenLoopback(t, "upstream")
+			targetLn := mustListenLoopback(t, "target")
+			target := targetFromListener(t, targetLn)
+
+			accepted := make(chan struct{}, 1)
+			go func() {
+				conn, err := targetLn.Accept()
+				if err == nil {
+					conn.Close()
+					accepted <- struct{}{}
+				}
+			}()
+
+			upstreamAddr := upstreamLn.Addr().String()
+			upstreamBackoffCache.clear(upstreamAddr)
+			t.Cleanup(func() { upstreamBackoffCache.clear(upstreamAddr) })
+
+			serverErr := make(chan error, 1)
+			go func() {
+				conn, err := upstreamLn.Accept()
+				if err != nil {
+					serverErr <- err
+					return
+				}
+				defer conn.Close()
+
+				if err := performUpstreamNoAuthHandshake(conn, target); err != nil {
+					serverErr <- err
+					return
+				}
+
+				// Upstream-side dial failure.
+				if _, err := conn.Write([]byte{socksVersion, tt.rep, socksRSV, socksAtypIPv4, 0, 0, 0, 0, 0, 0}); err != nil {
+					serverErr <- err
+					return
+				}
+				serverErr <- nil
+			}()
+
+			conn, viaUpstream, err := dial(upstreamAddr, target, 200*time.Millisecond, 200*time.Millisecond)
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer conn.Close()
+			if viaUpstream {
+				t.Fatal("expected direct fallback, got viaUpstream=true")
+			}
+			if err := <-serverErr; err != nil {
+				t.Fatalf("mock upstream failed: %v", err)
+			}
+
+			select {
+			case <-accepted:
+			case <-time.After(time.Second):
+				t.Fatal("target was not dialed directly")
+			}
+			if upstreamBackoffCache.shouldSkip(upstreamAddr, time.Now()) {
+				t.Fatal("backoff cache must not be marked on CONNECT rep failure")
+			}
+		})
+	}
+}
+
+func TestDialFallsBackOnConnectReplyTimeout(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	upstreamLn := mustListenLoopback(t, "upstream")
+	targetLn := mustListenLoopback(t, "target")
+	target := targetFromListener(t, targetLn)
+
+	accepted := make(chan struct{}, 1)
+	go func() {
+		conn, err := targetLn.Accept()
+		if err == nil {
+			conn.Close()
+			accepted <- struct{}{}
+		}
+	}()
+
+	upstreamAddr := upstreamLn.Addr().String()
+	upstreamBackoffCache.clear(upstreamAddr)
+	t.Cleanup(func() { upstreamBackoffCache.clear(upstreamAddr) })
+
+	serverErr := make(chan error, 1)
+	stall := make(chan struct{})
+	t.Cleanup(func() { close(stall) })
+	go func() {
+		conn, err := upstreamLn.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+
+		// Complete the greeting, then never answer the CONNECT request.
+		serverErr <- performUpstreamNoAuthHandshake(conn, target)
+		<-stall
+	}()
+
+	conn, viaUpstream, err := dial(upstreamAddr, target, time.Second, 200*time.Millisecond)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	if viaUpstream {
+		t.Fatal("expected direct fallback, got viaUpstream=true")
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("mock upstream failed: %v", err)
+	}
+
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("target was not dialed directly")
+	}
+	if !upstreamBackoffCache.shouldSkip(upstreamAddr, time.Now()) {
+		t.Fatal("backoff cache must be marked on CONNECT reply timeout")
+	}
+}
+
+func TestDialUpstreamAllowsConnectReplySlowerThanHelloTimeout(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	upstreamLn := mustListenLoopback(t, "upstream")
+
+	target := socks5Target{
+		atyp: socksAtypIPv4,
+		ip:   netip.MustParseAddr("1.2.3.4"),
+		port: 443,
+		addr: "1.2.3.4:443",
+	}
+
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, err := upstreamLn.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+
+		if err := performUpstreamNoAuthHandshake(conn, target); err != nil {
+			serverErr <- err
+			return
+		}
+
+		// Reply well after helloTimeout but within connectTimeout.
+		time.Sleep(600 * time.Millisecond)
+		reply := []byte{socksVersion, socksRepSucceeded, socksRSV, socksAtypIPv4, 127, 0, 0, 1, 0x12, 0x34}
+		if _, err := conn.Write(reply); err != nil {
+			serverErr <- err
+			return
+		}
+		serverErr <- nil
+	}()
+
+	conn, err := dialUpstream(upstreamLn.Addr().String(), target, 200*time.Millisecond, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dialUpstream: %v", err)
+	}
+	conn.Close()
+	if err := <-serverErr; err != nil {
+		t.Fatalf("mock upstream failed: %v", err)
 	}
 }
 
@@ -300,7 +472,7 @@ func TestDialMarksUnavailableBackoff(t *testing.T) {
 		addr: "127.0.0.1:1",
 	}
 
-	_, _, _ = dial(upstreamAddr, target, 100*time.Millisecond)
+	_, _, _ = dial(upstreamAddr, target, 100*time.Millisecond, 100*time.Millisecond)
 	if !upstreamBackoffCache.shouldSkip(upstreamAddr, time.Now()) {
 		t.Fatal("expected upstream backoff cache to be marked unavailable")
 	}
@@ -362,7 +534,7 @@ func startHandleSession(t *testing.T, upstream string, dialTimeout, clientReadTi
 	client, server := testClientServer(t)
 	done := make(chan struct{})
 	go func() {
-		handle(server, upstream, dialTimeout, clientReadTimeout)
+		handle(server, upstream, dialTimeout, dialTimeout, clientReadTimeout)
 		close(done)
 	}()
 	setDeadline(t, client, testIOTimeout)
@@ -463,6 +635,21 @@ func mustListenLoopback(t *testing.T, name string) net.Listener {
 	return ln
 }
 
+func targetFromListener(t *testing.T, ln net.Listener) socks5Target {
+	t.Helper()
+	tcpAddr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("expected *net.TCPAddr, got %T", ln.Addr())
+	}
+	addrPort := tcpAddr.AddrPort()
+	return socks5Target{
+		atyp: socksAtypIPv4,
+		ip:   addrPort.Addr().Unmap(),
+		port: addrPort.Port(),
+		addr: addrPort.String(),
+	}
+}
+
 func setDeadline(t *testing.T, conn net.Conn, timeout time.Duration) {
 	t.Helper()
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
@@ -504,7 +691,7 @@ func TestHandleHTTPConnect(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go handleHTTP(conn, upstreamLn.Addr().String(), 2*time.Second, 2*time.Second)
+			go handleHTTP(conn, upstreamLn.Addr().String(), 2*time.Second, 2*time.Second, 2*time.Second)
 		}
 	}()
 
@@ -585,7 +772,7 @@ func TestHandleHTTPPlainGET(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go handleHTTP(conn, upstreamLn.Addr().String(), 2*time.Second, 2*time.Second)
+			go handleHTTP(conn, upstreamLn.Addr().String(), 2*time.Second, 2*time.Second, 2*time.Second)
 		}
 	}()
 
@@ -663,7 +850,7 @@ func TestHandleHTTPPlainStripsProxyHeaders(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go handleHTTP(conn, upstreamLn.Addr().String(), 2*time.Second, 2*time.Second)
+			go handleHTTP(conn, upstreamLn.Addr().String(), 2*time.Second, 2*time.Second, 2*time.Second)
 		}
 	}()
 
@@ -697,7 +884,7 @@ func TestHandleHTTPRejectsInvalidProto(t *testing.T) {
 	client, server := testClientServer(t)
 	done := make(chan struct{})
 	go func() {
-		handleHTTP(server, "127.0.0.1:9", 100*time.Millisecond, 100*time.Millisecond)
+		handleHTTP(server, "127.0.0.1:9", 100*time.Millisecond, 100*time.Millisecond, 100*time.Millisecond)
 		close(done)
 	}()
 	setDeadline(t, client, testIOTimeout)
