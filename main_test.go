@@ -1278,6 +1278,40 @@ func TestHandleHTTPRejectsInvalidHostLength(t *testing.T) {
 	}
 }
 
+func TestHandleHTTPPlainRejectsNonHTTPScheme(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		uri  string
+	}{
+		{"https scheme", "https://example.com/"},
+		{"ftp scheme", "ftp://example.com/"},
+		{"empty scheme", "//example.com/"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, server := testClientServer(t)
+			done := make(chan struct{})
+			go func() {
+				handleHTTP(server, "127.0.0.1:9", 100*time.Millisecond, 100*time.Millisecond, 100*time.Millisecond)
+				close(done)
+			}()
+			setDeadline(t, client, testIOTimeout)
+
+			fmt.Fprintf(client, "GET %s HTTP/1.1\r\nHost: example.com\r\n\r\n", tc.uri)
+
+			br := bufio.NewReader(client)
+			resp, err := http.ReadResponse(br, nil)
+			if err != nil {
+				t.Fatalf("read response: %v", err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != 400 {
+				t.Fatalf("unexpected status: %d", resp.StatusCode)
+			}
+			waitDone(t, done)
+		})
+	}
+}
+
 func TestHandleHTTPRejectsOversizedLine(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

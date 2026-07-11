@@ -654,7 +654,7 @@ func handleHTTPConnect(client net.Conn, br *bufio.Reader, uri, proto, upstream s
 
 func handleHTTPPlain(client net.Conn, br *bufio.Reader, method, uri, proto, upstream string, dialTimeout, connectTimeout time.Duration) {
 	u, err := url.Parse(uri)
-	if err != nil || u.Host == "" {
+	if err != nil || u.Scheme != "http" || u.Host == "" {
 		client.Write([]byte(proto + " 400 Bad Request\r\n\r\n"))
 		return
 	}
