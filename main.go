@@ -147,16 +147,9 @@ func main() {
 			log.Fatal(err)
 		}
 		log.Printf("HTTP proxy listening on %s, upstream %s (dial-timeout %s, connect-timeout %s)", *httpListen, *upstream, *dialTimeout, *connectTimeout)
-		go func() {
-			for {
-				conn, err := httpLn.Accept()
-				if err != nil {
-					log.Printf("http accept: %v", err)
-					continue
-				}
-				go handleHTTP(conn, *upstream, *dialTimeout, *connectTimeout, *clientReadTimeout)
-			}
-		}()
+		go acceptLoop(httpLn, "http", func(conn net.Conn) {
+			handleHTTP(conn, *upstream, *dialTimeout, *connectTimeout, *clientReadTimeout)
+		})
 	}
 
 	ln, err := net.Listen("tcp", *listen)
@@ -165,13 +158,35 @@ func main() {
 	}
 	log.Printf("SOCKS5 listening on %s, upstream %s (dial-timeout %s, connect-timeout %s)", *listen, *upstream, *dialTimeout, *connectTimeout)
 
+	acceptLoop(ln, "socks5", func(conn net.Conn) {
+		handle(conn, *upstream, *dialTimeout, *connectTimeout, *clientReadTimeout)
+	})
+}
+
+// acceptLoop retries Accept errors with backoff so a persistent failure such
+// as EMFILE does not busy-spin.
+func acceptLoop(ln net.Listener, name string, handler func(net.Conn)) {
+	var delay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("accept: %v", err)
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			if delay == 0 {
+				delay = 5 * time.Millisecond
+			} else {
+				delay *= 2
+			}
+			if maxDelay := 1 * time.Second; delay > maxDelay {
+				delay = maxDelay
+			}
+			log.Printf("%s accept: %v; retrying in %s", name, err, delay)
+			time.Sleep(delay)
 			continue
 		}
-		go handle(conn, *upstream, *dialTimeout, *connectTimeout, *clientReadTimeout)
+		delay = 0
+		go handler(conn)
 	}
 }
 
