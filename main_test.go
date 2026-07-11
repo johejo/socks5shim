@@ -859,6 +859,84 @@ func TestHandleHTTPPlainForcesConnectionClose(t *testing.T) {
 	}
 }
 
+func TestHandleHTTPPlainSecondRequestNotMisrouted(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	// Two targets that honor keep-alive, each identified by its response body.
+	startTarget := func(marker string) string {
+		ln := mustListenLoopback(t, "target-"+marker)
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go func(c net.Conn) {
+					defer c.Close()
+					br := bufio.NewReader(c)
+					for {
+						req, err := http.ReadRequest(br)
+						if err != nil {
+							return
+						}
+						fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s", len(marker), marker)
+						if req.Close {
+							return
+						}
+					}
+				}(conn)
+			}
+		}()
+		return ln.Addr().String()
+	}
+	targetA := startTarget("target-a")
+	targetB := startTarget("target-b")
+
+	proxyAddr := startHTTPProxyStack(t, "")
+	conn := dialHTTPProxy(t, proxyAddr)
+	br := bufio.NewReader(conn)
+
+	sendGet := func(addr string) {
+		fmt.Fprintf(conn, "GET http://%s/ HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive\r\n\r\n", addr, addr)
+	}
+	readBody := func(which string) (string, error) {
+		resp, err := http.ReadResponse(br, nil)
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read %s response body: %v", which, err)
+		}
+		return string(body), nil
+	}
+
+	sendGet(targetA)
+	body, err := readBody("first")
+	if err != nil {
+		t.Fatalf("read first response: %v", err)
+	}
+	if body != "target-a" {
+		t.Fatalf("first response body = %q, want %q", body, "target-a")
+	}
+
+	// Second request on the same client connection targets B. The invariant:
+	// it must never be answered by A. Acceptable outcomes are a connection
+	// error (the proxy closed the connection after the first response) or a
+	// response from B (an implementation that routes each request).
+	setDeadline(t, conn, testIOTimeout)
+	sendGet(targetB)
+	body, err = readBody("second")
+	if err != nil {
+		t.Logf("proxy closed the connection before a second response: %v", err)
+		return
+	}
+	if body != "target-b" {
+		t.Fatalf("second response body = %q, want %q (misrouted to the first target?)", body, "target-b")
+	}
+}
+
 func TestHandleHTTPRejectsInvalidProto(t *testing.T) {
 	client, server := testClientServer(t)
 	done := make(chan struct{})
