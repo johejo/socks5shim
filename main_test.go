@@ -130,6 +130,59 @@ func TestReadTargetIPv6(t *testing.T) {
 	}
 }
 
+func TestBuildConnectRequest(t *testing.T) {
+	// Expected bytes are written out per RFC 1928 section 4, independent of
+	// the production encoder and decoder.
+	tests := []struct {
+		name   string
+		target socks5Target
+		want   []byte
+	}{
+		{
+			name: "domain",
+			target: socks5Target{
+				atyp:   socksAtypDomain,
+				domain: "example.com",
+				port:   443,
+			},
+			want: append(
+				append([]byte{0x05, 0x01, 0x00, 0x03, 0x0b}, "example.com"...),
+				0x01, 0xbb,
+			),
+		},
+		{
+			name: "ipv4",
+			target: socks5Target{
+				atyp: socksAtypIPv4,
+				ip:   netip.MustParseAddr("192.0.2.1"),
+				port: 80,
+			},
+			want: []byte{0x05, 0x01, 0x00, 0x01, 192, 0, 2, 1, 0x00, 0x50},
+		},
+		{
+			name: "ipv6",
+			target: socks5Target{
+				atyp: socksAtypIPv6,
+				ip:   netip.MustParseAddr("2001:db8::1"),
+				port: 443,
+			},
+			want: []byte{
+				0x05, 0x01, 0x00, 0x04,
+				0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+				0x01, 0xbb,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := buildConnectRequest(tt.target)
+			if !bytes.Equal(got, tt.want) {
+				t.Fatalf("unexpected request:\n got %x\nwant %x", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDrainBoundAddr(t *testing.T) {
 	domain := "example.com"
 	tests := []struct {
