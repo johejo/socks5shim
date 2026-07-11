@@ -1278,6 +1278,47 @@ func TestHandleHTTPRejectsInvalidHostLength(t *testing.T) {
 	}
 }
 
+func TestHandleHTTPRejectsOversizedLine(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		prefix string
+	}{
+		{"request line", "GET /"},
+		{"connect header", "CONNECT example.com:443 HTTP/1.1\r\nX-Pad: "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, server := testClientServer(t)
+			done := make(chan struct{})
+			go func() {
+				handleHTTP(server, "127.0.0.1:9", 100*time.Millisecond, 100*time.Millisecond, 100*time.Millisecond)
+				close(done)
+			}()
+			setDeadline(t, client, testIOTimeout)
+
+			// Write concurrently: it blocks once the handler's buffer fills,
+			// leaving this goroutine free to read the 431.
+			payload := append([]byte(tc.prefix), bytes.Repeat([]byte("a"), maxHTTPLineLength+1)...)
+			wrote := make(chan struct{})
+			go func() {
+				defer close(wrote)
+				client.Write(payload)
+			}()
+
+			br := bufio.NewReader(client)
+			resp, err := http.ReadResponse(br, nil)
+			if err != nil {
+				t.Fatalf("read response: %v", err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != 431 {
+				t.Fatalf("unexpected status: %d", resp.StatusCode)
+			}
+			waitDone(t, done)
+			<-wrote
+		})
+	}
+}
+
 func TestHandleHTTPConnectFallsBackToDirect(t *testing.T) {
 	skipIfShortNetwork(t)
 

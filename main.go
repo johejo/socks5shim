@@ -54,9 +54,12 @@ const (
 	defaultClientReadTimeout      = 5 * time.Second
 	directDialTimeout             = 10 * time.Second
 	upstreamUnavailableBackoff    = 3 * time.Second
+
+	maxHTTPLineLength = 8 << 10
 )
 
 var errAddressTypeNotSupported = errors.New("address type not supported")
+var errHTTPLineTooLong = errors.New("http line too long")
 var errUpstreamUnavailable = errors.New("upstream unavailable")
 var errUpstreamProtocol = errors.New("upstream protocol error")
 var errUnknownReplyAddressType = errors.New("unknown reply address type")
@@ -552,9 +555,10 @@ func handleHTTP(client net.Conn, upstream string, dialTimeout, connectTimeout, c
 		return
 	}
 
-	br := bufio.NewReader(client)
-	requestLine, err := br.ReadString('\n')
+	br := bufio.NewReaderSize(client, maxHTTPLineLength)
+	requestLine, err := readHTTPLine(br)
 	if err != nil {
+		respondLineTooLong(client, "HTTP/1.1", err)
 		return
 	}
 	requestLine = strings.TrimRight(requestLine, "\r\n")
@@ -577,11 +581,32 @@ func handleHTTP(client net.Conn, upstream string, dialTimeout, connectTimeout, c
 	}
 }
 
+// readHTTPLine reads one line, failing instead of buffering unboundedly
+// when no newline arrives within the reader's buffer size.
+func readHTTPLine(br *bufio.Reader) (string, error) {
+	line, err := br.ReadSlice('\n')
+	if err == bufio.ErrBufferFull {
+		return "", errHTTPLineTooLong
+	}
+	if err != nil {
+		return "", err
+	}
+	return string(line), nil
+}
+
+// respondLineTooLong writes a best-effort 431 if err is errHTTPLineTooLong.
+func respondLineTooLong(client net.Conn, proto string, err error) {
+	if errors.Is(err, errHTTPLineTooLong) {
+		client.Write([]byte(proto + " 431 Request Header Fields Too Large\r\n\r\n"))
+	}
+}
+
 func handleHTTPConnect(client net.Conn, br *bufio.Reader, uri, proto, upstream string, dialTimeout, connectTimeout time.Duration) {
 	// Read and discard headers until empty line.
 	for {
-		line, err := br.ReadString('\n')
+		line, err := readHTTPLine(br)
 		if err != nil {
+			respondLineTooLong(client, proto, err)
 			return
 		}
 		if strings.TrimRight(line, "\r\n") == "" {
@@ -665,8 +690,9 @@ func handleHTTPPlain(client net.Conn, br *bufio.Reader, method, uri, proto, upst
 	// Force Connection: close so neither side reuses the connection;
 	// relay() forwards raw bytes and cannot route a second request.
 	for {
-		line, err := br.ReadString('\n')
+		line, err := readHTTPLine(br)
 		if err != nil {
+			respondLineTooLong(client, proto, err)
 			return
 		}
 		trimmed := strings.TrimRight(line, "\r\n")
