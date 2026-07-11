@@ -788,6 +788,77 @@ func TestHandleHTTPPlainStripsProxyHeaders(t *testing.T) {
 	}
 }
 
+func TestHandleHTTPPlainForcesConnectionClose(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	// Target server that honors keep-alive: it keeps serving requests on
+	// the same connection unless the request asked for Connection: close.
+	targetLn := mustListenLoopback(t, "target")
+	connHeader := make(chan string, 1)
+	keepAliveHeader := make(chan string, 1)
+	go func() {
+		for {
+			conn, err := targetLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				for {
+					req, err := http.ReadRequest(br)
+					if err != nil {
+						return
+					}
+					select {
+					case connHeader <- req.Header.Get("Connection"):
+					default:
+					}
+					select {
+					case keepAliveHeader <- req.Header.Get("Keep-Alive"):
+					default:
+					}
+					body := "OK"
+					fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+					if req.Close {
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+
+	proxyAddr := startHTTPProxyStack(t, "")
+	conn := dialHTTPProxy(t, proxyAddr)
+
+	targetAddr := targetLn.Addr().String()
+	fmt.Fprintf(conn, "GET http://%s/ HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5, max=100\r\n\r\n", targetAddr, targetAddr)
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	resp.Body.Close()
+
+	if got := <-connHeader; got != "close" {
+		t.Fatalf("target received Connection: %q, want %q", got, "close")
+	}
+	if got := <-keepAliveHeader; got != "" {
+		t.Fatalf("Keep-Alive was not stripped: %q", got)
+	}
+
+	// The proxy must close the client connection after the response so a
+	// second request cannot be misrouted to the first target.
+	setDeadline(t, conn, testIOTimeout)
+	if _, err := br.ReadByte(); err != io.EOF {
+		t.Fatalf("expected EOF after response, got %v", err)
+	}
+}
+
 func TestHandleHTTPRejectsInvalidProto(t *testing.T) {
 	client, server := testClientServer(t)
 	done := make(chan struct{})
@@ -891,9 +962,11 @@ func serveMockUpstream(conn net.Conn, fixedTarget string) {
 	done := make(chan struct{})
 	go func() {
 		io.Copy(remote, conn)
+		closeWrite(remote)
 		close(done)
 	}()
 	io.Copy(conn, remote)
+	closeWrite(conn)
 	<-done
 }
 

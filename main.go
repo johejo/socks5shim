@@ -662,6 +662,8 @@ func handleHTTPPlain(client net.Conn, br *bufio.Reader, method, uri, proto, upst
 	}
 
 	// Forward headers, removing hop-by-hop Proxy-* headers.
+	// Force Connection: close so neither side reuses the connection;
+	// relay() forwards raw bytes and cannot route a second request.
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil {
@@ -669,11 +671,11 @@ func handleHTTPPlain(client net.Conn, br *bufio.Reader, method, uri, proto, upst
 		}
 		trimmed := strings.TrimRight(line, "\r\n")
 		if trimmed == "" {
-			remote.Write([]byte("\r\n"))
+			remote.Write([]byte("Connection: close\r\n\r\n"))
 			break
 		}
 		lower := strings.ToLower(trimmed)
-		if strings.HasPrefix(lower, "proxy-connection:") || strings.HasPrefix(lower, "proxy-authorization:") {
+		if strings.HasPrefix(lower, "proxy-connection:") || strings.HasPrefix(lower, "proxy-authorization:") || strings.HasPrefix(lower, "connection:") || strings.HasPrefix(lower, "keep-alive:") {
 			continue
 		}
 		remote.Write([]byte(line))
