@@ -704,6 +704,11 @@ func parseHostPort(hostport, defaultPort string) (string, uint16, error) {
 		host = hostport
 		portStr = defaultPort
 	}
+	// buildConnectRequest encodes the domain length as a single byte;
+	// byte(len) silently truncates mod 256, so reject oversized hosts here.
+	if host == "" || len(host) > 255 {
+		return "", 0, fmt.Errorf("invalid host length: %d", len(host))
+	}
 	p, err := strconv.Atoi(portStr)
 	if err != nil || p <= 0 || p > 65535 {
 		return "", 0, fmt.Errorf("invalid port: %s", portStr)

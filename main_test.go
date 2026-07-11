@@ -875,6 +875,39 @@ func TestHandleHTTPRejectsInvalidProto(t *testing.T) {
 	waitDone(t, done)
 }
 
+func TestHandleHTTPRejectsInvalidHostLength(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		uri  string
+	}{
+		{"empty host", ":443"},
+		{"oversized host", strings.Repeat("a", 256) + ":443"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, server := testClientServer(t)
+			done := make(chan struct{})
+			go func() {
+				handleHTTP(server, "127.0.0.1:9", 100*time.Millisecond, 100*time.Millisecond, 100*time.Millisecond)
+				close(done)
+			}()
+			setDeadline(t, client, testIOTimeout)
+
+			fmt.Fprintf(client, "CONNECT %s HTTP/1.1\r\nHost: example.com\r\n\r\n", tc.uri)
+
+			br := bufio.NewReader(client)
+			resp, err := http.ReadResponse(br, nil)
+			if err != nil {
+				t.Fatalf("read response: %v", err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != 400 {
+				t.Fatalf("unexpected status: %d", resp.StatusCode)
+			}
+			waitDone(t, done)
+		})
+	}
+}
+
 // startHTTPProxyStack starts a mock upstream SOCKS5 proxy and an HTTP proxy
 // listener in front of it, returning the HTTP proxy address. fixedTarget is
 // passed through to serveMockUpstream.
