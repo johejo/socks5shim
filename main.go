@@ -58,7 +58,6 @@ const (
 
 var errAddressTypeNotSupported = errors.New("address type not supported")
 var errUpstreamUnavailable = errors.New("upstream unavailable")
-var errUpstreamConnectTimeout = errors.New("upstream CONNECT timed out")
 var errUpstreamProtocol = errors.New("upstream protocol error")
 var errUnknownReplyAddressType = errors.New("unknown reply address type")
 
@@ -144,7 +143,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		log.Printf("HTTP proxy listening on %s, upstream %s (timeout %s)", *httpListen, *upstream, *dialTimeout)
+		log.Printf("HTTP proxy listening on %s, upstream %s (dial-timeout %s, connect-timeout %s)", *httpListen, *upstream, *dialTimeout, *connectTimeout)
 		go func() {
 			for {
 				conn, err := httpLn.Accept()
@@ -161,7 +160,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("SOCKS5 listening on %s, upstream %s (timeout %s)", *listen, *upstream, *dialTimeout)
+	log.Printf("SOCKS5 listening on %s, upstream %s (dial-timeout %s, connect-timeout %s)", *listen, *upstream, *dialTimeout, *connectTimeout)
 
 	for {
 		conn, err := ln.Accept()
@@ -376,17 +375,12 @@ func dial(upstream string, target socks5Target, helloTimeout, connectTimeout tim
 		log.Printf("upstream CONNECT failed (rep=0x%02x) for %s; falling back to direct", connectErr.rep, target.addr)
 		return dialDirect(target)
 	}
-	if errors.Is(err, errUpstreamConnectTimeout) {
-		// A timeout says nothing about upstream health; back off so a
-		// wedged upstream doesn't stall every connection for connectTimeout.
-		upstreamBackoffCache.markUnavailable(upstream, time.Now())
-		log.Printf("upstream CONNECT timed out for %s; falling back to direct", target.addr)
-		return dialDirect(target)
-	}
 	if !errors.Is(err, errUpstreamUnavailable) {
 		return nil, false, err
 	}
 
+	// Covers CONNECT reply timeouts too: back off so a wedged upstream
+	// doesn't stall every connection for connectTimeout.
 	upstreamBackoffCache.markUnavailable(upstream, time.Now())
 	log.Printf("upstream unavailable: %v; falling back to direct", err)
 	return dialDirect(target)
@@ -443,13 +437,13 @@ func dialUpstream(addr string, target socks5Target, helloTimeout, connectTimeout
 
 	// CONNECT request
 	if _, err := conn.Write(buildConnectRequest(target)); err != nil {
-		return nil, classifyConnectPhaseErr(err)
+		return nil, fmt.Errorf("%w: %v", errUpstreamUnavailable, err)
 	}
 
 	// Read reply header
 	reply := make([]byte, socksConnectHeaderLen)
 	if _, err := io.ReadFull(conn, reply); err != nil {
-		return nil, classifyConnectPhaseErr(err)
+		return nil, fmt.Errorf("%w: %v", errUpstreamUnavailable, err)
 	}
 	if reply[0] != socksVersion || reply[2] != socksRSV {
 		return nil, fmt.Errorf("%w: reply header ver=0x%02x rsv=0x%02x", errUpstreamProtocol, reply[0], reply[2])
@@ -461,7 +455,7 @@ func dialUpstream(addr string, target socks5Target, helloTimeout, connectTimeout
 		if errors.Is(err, errUnknownReplyAddressType) {
 			return nil, fmt.Errorf("%w: %v", errUpstreamProtocol, err)
 		}
-		return nil, classifyConnectPhaseErr(err)
+		return nil, fmt.Errorf("%w: %v", errUpstreamUnavailable, err)
 	}
 
 	// Success. Zero value of time.Time means no deadline.
@@ -470,16 +464,6 @@ func dialUpstream(addr string, target socks5Target, helloTimeout, connectTimeout
 	return conn, nil
 }
 
-// classifyConnectPhaseErr separates a CONNECT reply timeout from the upstream
-// dying mid-handshake. Both end up backoff-cached, but the timeout gets its
-// own error so dial can log it distinctly.
-func classifyConnectPhaseErr(err error) error {
-	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
-		return fmt.Errorf("%w: %v", errUpstreamConnectTimeout, err)
-	}
-	return fmt.Errorf("%w: %v", errUpstreamUnavailable, err)
-}
 
 func buildConnectRequest(t socks5Target) []byte {
 	buf := []byte{socksVersion, socksCmdConnect, socksRSV, t.atyp}

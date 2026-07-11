@@ -221,63 +221,10 @@ func TestDialFallsBackOnUpstreamDialFailure(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			upstreamLn := mustListenLoopback(t, "upstream")
-			targetLn := mustListenLoopback(t, "target")
-			target := targetFromListener(t, targetLn)
-
-			accepted := make(chan struct{}, 1)
-			go func() {
-				conn, err := targetLn.Accept()
-				if err == nil {
-					conn.Close()
-					accepted <- struct{}{}
-				}
-			}()
-
-			upstreamAddr := upstreamLn.Addr().String()
-			upstreamBackoffCache.clear(upstreamAddr)
-			t.Cleanup(func() { upstreamBackoffCache.clear(upstreamAddr) })
-
-			serverErr := make(chan error, 1)
-			go func() {
-				conn, err := upstreamLn.Accept()
-				if err != nil {
-					serverErr <- err
-					return
-				}
-				defer conn.Close()
-
-				if err := performUpstreamNoAuthHandshake(conn, target); err != nil {
-					serverErr <- err
-					return
-				}
-
-				// Upstream-side dial failure.
-				if _, err := conn.Write([]byte{socksVersion, tt.rep, socksRSV, socksAtypIPv4, 0, 0, 0, 0, 0, 0}); err != nil {
-					serverErr <- err
-					return
-				}
-				serverErr <- nil
-			}()
-
-			conn, viaUpstream, err := dial(upstreamAddr, target, 200*time.Millisecond, 200*time.Millisecond)
-			if err != nil {
-				t.Fatalf("dial: %v", err)
-			}
-			defer conn.Close()
-			if viaUpstream {
-				t.Fatal("expected direct fallback, got viaUpstream=true")
-			}
-			if err := <-serverErr; err != nil {
-				t.Fatalf("mock upstream failed: %v", err)
-			}
-
-			select {
-			case <-accepted:
-			case <-time.After(time.Second):
-				t.Fatal("target was not dialed directly")
-			}
-			if upstreamBackoffCache.shouldSkip(upstreamAddr, time.Now()) {
+			// Upstream-side dial failure.
+			fx := startDialFallbackFixture(t, []byte{socksVersion, tt.rep, socksRSV, socksAtypIPv4, 0, 0, 0, 0, 0, 0})
+			fx.assertDirectFallback(t, 200*time.Millisecond, 200*time.Millisecond)
+			if upstreamBackoffCache.shouldSkip(fx.upstreamAddr, time.Now()) {
 				t.Fatal("backoff cache must not be marked on CONNECT rep failure")
 			}
 		})
@@ -286,6 +233,27 @@ func TestDialFallsBackOnUpstreamDialFailure(t *testing.T) {
 
 func TestDialFallsBackOnConnectReplyTimeout(t *testing.T) {
 	skipIfShortNetwork(t)
+
+	// Upstream completes the greeting, then never answers the CONNECT request.
+	fx := startDialFallbackFixture(t, nil)
+	fx.assertDirectFallback(t, time.Second, 200*time.Millisecond)
+	if !upstreamBackoffCache.shouldSkip(fx.upstreamAddr, time.Now()) {
+		t.Fatal("backoff cache must be marked on CONNECT reply timeout")
+	}
+}
+
+type dialFallbackFixture struct {
+	upstreamAddr string
+	target       socks5Target
+	accepted     chan struct{}
+	serverErr    chan error
+}
+
+// startDialFallbackFixture starts a target listener that signals when it is
+// dialed and a mock upstream that completes the greeting, then writes
+// connectReply. An empty connectReply makes the upstream stall until cleanup.
+func startDialFallbackFixture(t *testing.T, connectReply []byte) dialFallbackFixture {
+	t.Helper()
 
 	upstreamLn := mustListenLoopback(t, "upstream")
 	targetLn := mustListenLoopback(t, "target")
@@ -304,9 +272,13 @@ func TestDialFallsBackOnConnectReplyTimeout(t *testing.T) {
 	upstreamBackoffCache.clear(upstreamAddr)
 	t.Cleanup(func() { upstreamBackoffCache.clear(upstreamAddr) })
 
+	var stall chan struct{}
+	if len(connectReply) == 0 {
+		stall = make(chan struct{})
+		t.Cleanup(func() { close(stall) })
+	}
+
 	serverErr := make(chan error, 1)
-	stall := make(chan struct{})
-	t.Cleanup(func() { close(stall) })
 	go func() {
 		conn, err := upstreamLn.Accept()
 		if err != nil {
@@ -315,12 +287,33 @@ func TestDialFallsBackOnConnectReplyTimeout(t *testing.T) {
 		}
 		defer conn.Close()
 
-		// Complete the greeting, then never answer the CONNECT request.
-		serverErr <- performUpstreamNoAuthHandshake(conn, target)
-		<-stall
+		if err := performUpstreamNoAuthHandshake(conn, target); err != nil {
+			serverErr <- err
+			return
+		}
+		if len(connectReply) == 0 {
+			serverErr <- nil
+			<-stall
+			return
+		}
+		_, err = conn.Write(connectReply)
+		serverErr <- err
 	}()
 
-	conn, viaUpstream, err := dial(upstreamAddr, target, time.Second, 200*time.Millisecond)
+	return dialFallbackFixture{
+		upstreamAddr: upstreamAddr,
+		target:       target,
+		accepted:     accepted,
+		serverErr:    serverErr,
+	}
+}
+
+// assertDirectFallback runs dial and checks it fell back to a direct
+// connection to the target.
+func (fx dialFallbackFixture) assertDirectFallback(t *testing.T, helloTimeout, connectTimeout time.Duration) {
+	t.Helper()
+
+	conn, viaUpstream, err := dial(fx.upstreamAddr, fx.target, helloTimeout, connectTimeout)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -328,17 +321,14 @@ func TestDialFallsBackOnConnectReplyTimeout(t *testing.T) {
 	if viaUpstream {
 		t.Fatal("expected direct fallback, got viaUpstream=true")
 	}
-	if err := <-serverErr; err != nil {
+	if err := <-fx.serverErr; err != nil {
 		t.Fatalf("mock upstream failed: %v", err)
 	}
 
 	select {
-	case <-accepted:
+	case <-fx.accepted:
 	case <-time.After(time.Second):
 		t.Fatal("target was not dialed directly")
-	}
-	if !upstreamBackoffCache.shouldSkip(upstreamAddr, time.Now()) {
-		t.Fatal("backoff cache must be marked on CONNECT reply timeout")
 	}
 }
 
@@ -671,37 +661,9 @@ func TestHandleHTTPConnect(t *testing.T) {
 		io.Copy(conn, conn)
 	}()
 
-	// Start a mock upstream SOCKS5 proxy that connects to the target.
-	upstreamLn := mustListenLoopback(t, "upstream")
-	go func() {
-		for {
-			conn, err := upstreamLn.Accept()
-			if err != nil {
-				return
-			}
-			go serveMockUpstream(conn, targetLn.Addr().String())
-		}
-	}()
-
-	// Start HTTP proxy listener.
-	httpLn := mustListenLoopback(t, "http-proxy")
-	go func() {
-		for {
-			conn, err := httpLn.Accept()
-			if err != nil {
-				return
-			}
-			go handleHTTP(conn, upstreamLn.Addr().String(), 2*time.Second, 2*time.Second, 2*time.Second)
-		}
-	}()
-
 	// Connect to the HTTP proxy and send a CONNECT request.
-	conn, err := net.DialTimeout("tcp", httpLn.Addr().String(), 2*time.Second)
-	if err != nil {
-		t.Fatalf("dial HTTP proxy: %v", err)
-	}
-	defer conn.Close()
-	setDeadline(t, conn, testIOTimeout)
+	proxyAddr := startHTTPProxyStack(t, targetLn.Addr().String())
+	conn := dialHTTPProxy(t, proxyAddr)
 
 	fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", targetLn.Addr().String(), targetLn.Addr().String())
 
@@ -752,37 +714,9 @@ func TestHandleHTTPPlainGET(t *testing.T) {
 		}
 	}()
 
-	// Start a mock upstream SOCKS5 proxy.
-	upstreamLn := mustListenLoopback(t, "upstream")
-	go func() {
-		for {
-			conn, err := upstreamLn.Accept()
-			if err != nil {
-				return
-			}
-			go serveMockUpstream(conn, "")
-		}
-	}()
-
-	// Start HTTP proxy listener.
-	httpLn := mustListenLoopback(t, "http-proxy")
-	go func() {
-		for {
-			conn, err := httpLn.Accept()
-			if err != nil {
-				return
-			}
-			go handleHTTP(conn, upstreamLn.Addr().String(), 2*time.Second, 2*time.Second, 2*time.Second)
-		}
-	}()
-
 	// Send a plain HTTP GET through the proxy.
-	conn, err := net.DialTimeout("tcp", httpLn.Addr().String(), 2*time.Second)
-	if err != nil {
-		t.Fatalf("dial HTTP proxy: %v", err)
-	}
-	defer conn.Close()
-	setDeadline(t, conn, testIOTimeout)
+	proxyAddr := startHTTPProxyStack(t, "")
+	conn := dialHTTPProxy(t, proxyAddr)
 
 	targetAddr := targetLn.Addr().String()
 	fmt.Fprintf(conn, "GET http://%s/test HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", targetAddr, targetAddr)
@@ -832,34 +766,8 @@ func TestHandleHTTPPlainStripsProxyHeaders(t *testing.T) {
 		}
 	}()
 
-	upstreamLn := mustListenLoopback(t, "upstream")
-	go func() {
-		for {
-			conn, err := upstreamLn.Accept()
-			if err != nil {
-				return
-			}
-			go serveMockUpstream(conn, "")
-		}
-	}()
-
-	httpLn := mustListenLoopback(t, "http-proxy")
-	go func() {
-		for {
-			conn, err := httpLn.Accept()
-			if err != nil {
-				return
-			}
-			go handleHTTP(conn, upstreamLn.Addr().String(), 2*time.Second, 2*time.Second, 2*time.Second)
-		}
-	}()
-
-	conn, err := net.DialTimeout("tcp", httpLn.Addr().String(), 2*time.Second)
-	if err != nil {
-		t.Fatalf("dial HTTP proxy: %v", err)
-	}
-	defer conn.Close()
-	setDeadline(t, conn, testIOTimeout)
+	proxyAddr := startHTTPProxyStack(t, "")
+	conn := dialHTTPProxy(t, proxyAddr)
 
 	targetAddr := targetLn.Addr().String()
 	fmt.Fprintf(conn, "GET http://%s/ HTTP/1.1\r\nHost: %s\r\nProxy-Connection: keep-alive\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\nConnection: close\r\n\r\n", targetAddr, targetAddr)
@@ -894,6 +802,47 @@ func TestHandleHTTPRejectsInvalidProto(t *testing.T) {
 
 	// The handler should close the connection because proto is not HTTP/1.0 or HTTP/1.1.
 	waitDone(t, done)
+}
+
+// startHTTPProxyStack starts a mock upstream SOCKS5 proxy and an HTTP proxy
+// listener in front of it, returning the HTTP proxy address. fixedTarget is
+// passed through to serveMockUpstream.
+func startHTTPProxyStack(t *testing.T, fixedTarget string) string {
+	t.Helper()
+
+	upstreamLn := mustListenLoopback(t, "upstream")
+	go func() {
+		for {
+			conn, err := upstreamLn.Accept()
+			if err != nil {
+				return
+			}
+			go serveMockUpstream(conn, fixedTarget)
+		}
+	}()
+
+	httpLn := mustListenLoopback(t, "http-proxy")
+	go func() {
+		for {
+			conn, err := httpLn.Accept()
+			if err != nil {
+				return
+			}
+			go handleHTTP(conn, upstreamLn.Addr().String(), testIOTimeout, testIOTimeout, testIOTimeout)
+		}
+	}()
+	return httpLn.Addr().String()
+}
+
+func dialHTTPProxy(t *testing.T, addr string) net.Conn {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", addr, testIOTimeout)
+	if err != nil {
+		t.Fatalf("dial HTTP proxy: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	setDeadline(t, conn, testIOTimeout)
+	return conn
 }
 
 // serveMockUpstream is a minimal SOCKS5 server that connects to real targets.
