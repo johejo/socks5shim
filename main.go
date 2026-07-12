@@ -18,6 +18,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/johejo/socks5shim/internal/httpguts"
 )
 
 const (
@@ -272,13 +274,11 @@ func (p *proxy) handle(client net.Conn) {
 	if _, err := io.ReadFull(client, methods); err != nil {
 		return
 	}
-	// Select "no authentication required" only if the client offered it.
 	if !slices.Contains(methods, socksMethodNoAuth) {
 		client.Write([]byte{socksVersion, socksMethodNoAcceptable})
 		return
 	}
 
-	// Reply: no auth
 	if _, err := client.Write([]byte{socksVersion, socksMethodNoAuth}); err != nil {
 		return
 	}
@@ -292,7 +292,7 @@ func (p *proxy) handle(client net.Conn) {
 		sendReply(client, socksRepGeneralFailure)
 		return
 	}
-	if req[1] != socksCmdConnect { // only CONNECT supported
+	if req[1] != socksCmdConnect {
 		sendReply(client, socksRepCommandNotSupported)
 		return
 	}
@@ -343,7 +343,7 @@ func readTarget(r io.Reader, atyp byte) (socks5Target, error) {
 	t.atyp = atyp
 
 	switch atyp {
-	case socksAtypIPv4: // IPv4
+	case socksAtypIPv4:
 		buf := make([]byte, socksIPv4AddrLen+socksPortLen)
 		if _, err := io.ReadFull(r, buf); err != nil {
 			return t, err
@@ -351,7 +351,7 @@ func readTarget(r io.Reader, atyp byte) (socks5Target, error) {
 		t.ip = netip.AddrFrom4([socksIPv4AddrLen]byte(buf[:socksIPv4AddrLen]))
 		t.port = binary.BigEndian.Uint16(buf[socksIPv4AddrLen : socksIPv4AddrLen+socksPortLen])
 
-	case socksAtypDomain: // Domain
+	case socksAtypDomain:
 		lenBuf := make([]byte, 1)
 		if _, err := io.ReadFull(r, lenBuf); err != nil {
 			return t, err
@@ -366,7 +366,7 @@ func readTarget(r io.Reader, atyp byte) (socks5Target, error) {
 		t.domain = string(buf[:lenBuf[0]])
 		t.port = binary.BigEndian.Uint16(buf[lenBuf[0]:])
 
-	case socksAtypIPv6: // IPv6
+	case socksAtypIPv6:
 		buf := make([]byte, socksIPv6AddrLen+socksPortLen)
 		if _, err := io.ReadFull(r, buf); err != nil {
 			return t, err
@@ -500,7 +500,6 @@ func (p *proxy) dialUpstream(target socks5Target) (net.Conn, error) {
 		return nil, fmt.Errorf("%w: %v", errUpstreamUnavailable, err)
 	}
 
-	// Read reply header
 	reply := make([]byte, socksConnectHeaderLen)
 	if _, err := io.ReadFull(conn, reply); err != nil {
 		return nil, fmt.Errorf("%w: %v", errUpstreamUnavailable, err)
@@ -518,7 +517,6 @@ func (p *proxy) dialUpstream(target socks5Target) (net.Conn, error) {
 		return nil, fmt.Errorf("%w: %v", errUpstreamUnavailable, err)
 	}
 
-	// Success. Zero value of time.Time means no deadline.
 	conn.SetDeadline(time.Time{})
 	ok = true
 	return conn, nil
@@ -621,6 +619,11 @@ func (p *proxy) handleHTTP(client net.Conn) {
 		return
 	}
 	method, uri, proto := parts[0], parts[1], parts[2]
+
+	// A method is a token (RFC 9110 §9.1), the same grammar ValidHeaderFieldName checks.
+	if !httpguts.ValidHeaderFieldName(method) {
+		return
+	}
 
 	// Validate protocol version to prevent header injection.
 	if proto != "HTTP/1.0" && proto != "HTTP/1.1" {
@@ -821,13 +824,14 @@ func (p *proxy) handleHTTPPlain(client net.Conn, br *bufio.Reader, method, uri, 
 }
 
 // splitHeaderLine splits a raw header line into its lowercased field name
-// and raw value. Lines with no colon, an empty name, or whitespace in the
-// name — which covers obs-fold continuations and space-before-colon — are
-// rejected (RFC 9112 §5.1, §5.2): forwarding them verbatim invites the
-// origin to parse the request differently than this proxy did.
+// and raw value. Non-token names (covers obs-fold continuations and
+// space-before-colon) and control bytes in the value (notably a bare CR,
+// which some origins treat as a line terminator) are rejected: forwarding
+// them verbatim invites the origin to parse the request differently than
+// this proxy did.
 func splitHeaderLine(line string) (name, value string, ok bool) {
 	name, value, found := strings.Cut(strings.TrimRight(line, "\r\n"), ":")
-	if !found || name == "" || strings.ContainsAny(name, " \t") {
+	if !found || !httpguts.ValidHeaderFieldName(name) || !httpguts.ValidHeaderFieldValue(value) {
 		return "", "", false
 	}
 	return strings.ToLower(name), value, true

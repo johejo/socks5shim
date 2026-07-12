@@ -1072,6 +1072,11 @@ func TestSplitHeaderLine(t *testing.T) {
 		{"\tfolded: v\r\n", "", "", false},
 		{"no-colon-line\r\n", "", "", false},
 		{": v\r\n", "", "", false},
+		{"X@A: v\r\n", "", "", false},
+		{"X\x00A: v\r\n", "", "", false},
+		{"X-A: a\rEvil: b\r\n", "", "", false},
+		{"X-A: a\x00b\r\n", "", "", false},
+		{"X-A: a\x7fb\r\n", "", "", false},
 	} {
 		name, value, ok := splitHeaderLine(tc.line)
 		if name != tc.name || value != tc.value || ok != tc.ok {
@@ -1092,6 +1097,8 @@ func TestHandleHTTPPlainRejectsMalformedHeaders(t *testing.T) {
 		{"space before colon", "X-A : v\r\n"},
 		{"no colon", "garbage\r\n"},
 		{"empty name", ": v\r\n"},
+		{"non-token name", "X@A: v\r\n"},
+		{"bare CR in value", "X-A: a\rEvil: b\r\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			targetAddr := unreachableTargetAddr
@@ -1256,6 +1263,16 @@ func TestHandleHTTPRejectsInvalidProto(t *testing.T) {
 	fmt.Fprintf(client, "GET / HTTP/2.0\r\nHost: example.com\r\n\r\n")
 
 	// The handler should close the connection because proto is not HTTP/1.0 or HTTP/1.1.
+	waitDone(t, done)
+}
+
+func TestHandleHTTPRejectsNonTokenMethod(t *testing.T) {
+	client, done := startHandleHTTPSession(t, newTestProxy("127.0.0.1:9"))
+
+	// Send a request whose method is not a valid token.
+	fmt.Fprintf(client, "GE\x00T / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+
+	// The handler should close the connection because the method is not a token.
 	waitDone(t, done)
 }
 
