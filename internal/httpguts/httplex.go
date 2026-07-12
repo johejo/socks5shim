@@ -4,11 +4,6 @@
 
 package httpguts
 
-import (
-	"strings"
-	"unicode/utf8"
-)
-
 var isTokenTable = [256]bool{
 	'!':  true,
 	'#':  true,
@@ -89,80 +84,6 @@ var isTokenTable = [256]bool{
 	'~':  true,
 }
 
-func IsTokenRune(r rune) bool {
-	return r < utf8.RuneSelf && isTokenTable[byte(r)]
-}
-
-// HeaderValuesContainsToken reports whether any string in values
-// contains the provided token, ASCII case-insensitively.
-func HeaderValuesContainsToken(values []string, token string) bool {
-	for _, v := range values {
-		if headerValueContainsToken(v, token) {
-			return true
-		}
-	}
-	return false
-}
-
-// isOWS reports whether b is an optional whitespace byte, as defined
-// by RFC 7230 section 3.2.3.
-func isOWS(b byte) bool { return b == ' ' || b == '\t' }
-
-// trimOWS returns x with all optional whitespace removes from the
-// beginning and end.
-func trimOWS(x string) string {
-	// TODO: consider using strings.Trim(x, " \t") instead,
-	// if and when it's fast enough. See issue 10292.
-	// But this ASCII-only code will probably always beat UTF-8
-	// aware code.
-	for len(x) > 0 && isOWS(x[0]) {
-		x = x[1:]
-	}
-	for len(x) > 0 && isOWS(x[len(x)-1]) {
-		x = x[:len(x)-1]
-	}
-	return x
-}
-
-// headerValueContainsToken reports whether v (assumed to be a
-// 0#element, in the ABNF extension described in RFC 7230 section 7)
-// contains token amongst its comma-separated tokens, ASCII
-// case-insensitively.
-func headerValueContainsToken(v string, token string) bool {
-	for comma := strings.IndexByte(v, ','); comma != -1; comma = strings.IndexByte(v, ',') {
-		if tokenEqual(trimOWS(v[:comma]), token) {
-			return true
-		}
-		v = v[comma+1:]
-	}
-	return tokenEqual(trimOWS(v), token)
-}
-
-// lowerASCII returns the ASCII lowercase version of b.
-func lowerASCII(b byte) byte {
-	if 'A' <= b && b <= 'Z' {
-		return b + ('a' - 'A')
-	}
-	return b
-}
-
-// tokenEqual reports whether t1 and t2 are equal, ASCII case-insensitively.
-func tokenEqual(t1, t2 string) bool {
-	if len(t1) != len(t2) {
-		return false
-	}
-	for i, b := range t1 {
-		if b >= utf8.RuneSelf {
-			// No UTF-8 or non-ASCII allowed in tokens.
-			return false
-		}
-		if lowerASCII(byte(b)) != lowerASCII(t2[i]) {
-			return false
-		}
-	}
-	return true
-}
-
 // isLWS reports whether b is linear white space, according
 // to http://www.w3.org/Protocols/rfc2616/rfc2616-sec2.html#sec2.2
 //
@@ -200,63 +121,6 @@ func ValidHeaderFieldName(v string) bool {
 		}
 	}
 	return true
-}
-
-// ValidHostHeader reports whether h is a valid host header.
-func ValidHostHeader(h string) bool {
-	// The latest spec is actually this:
-	//
-	// http://tools.ietf.org/html/rfc7230#section-5.4
-	//     Host = uri-host [ ":" port ]
-	//
-	// Where uri-host is:
-	//     http://tools.ietf.org/html/rfc3986#section-3.2.2
-	//
-	// But we're going to be much more lenient for now and just
-	// search for any byte that's not a valid byte in any of those
-	// expressions.
-	for i := 0; i < len(h); i++ {
-		if !validHostByte[h[i]] {
-			return false
-		}
-	}
-	return true
-}
-
-// See the validHostHeader comment.
-var validHostByte = [256]bool{
-	'0': true, '1': true, '2': true, '3': true, '4': true, '5': true, '6': true, '7': true,
-	'8': true, '9': true,
-
-	'a': true, 'b': true, 'c': true, 'd': true, 'e': true, 'f': true, 'g': true, 'h': true,
-	'i': true, 'j': true, 'k': true, 'l': true, 'm': true, 'n': true, 'o': true, 'p': true,
-	'q': true, 'r': true, 's': true, 't': true, 'u': true, 'v': true, 'w': true, 'x': true,
-	'y': true, 'z': true,
-
-	'A': true, 'B': true, 'C': true, 'D': true, 'E': true, 'F': true, 'G': true, 'H': true,
-	'I': true, 'J': true, 'K': true, 'L': true, 'M': true, 'N': true, 'O': true, 'P': true,
-	'Q': true, 'R': true, 'S': true, 'T': true, 'U': true, 'V': true, 'W': true, 'X': true,
-	'Y': true, 'Z': true,
-
-	'!':  true, // sub-delims
-	'$':  true, // sub-delims
-	'%':  true, // pct-encoded (and used in IPv6 zones)
-	'&':  true, // sub-delims
-	'(':  true, // sub-delims
-	')':  true, // sub-delims
-	'*':  true, // sub-delims
-	'+':  true, // sub-delims
-	',':  true, // sub-delims
-	'-':  true, // unreserved
-	'.':  true, // unreserved
-	':':  true, // IPv6address + Host expression's optional port
-	';':  true, // sub-delims
-	'=':  true, // sub-delims
-	'[':  true,
-	'\'': true, // sub-delims
-	']':  true,
-	'_':  true, // unreserved
-	'~':  true, // unreserved
 }
 
 // ValidHeaderFieldValue reports whether v is a valid "field-value" according to

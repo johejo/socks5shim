@@ -1058,34 +1058,6 @@ func TestHandleHTTPPlainRejectsOversizedHeaders(t *testing.T) {
 	<-wrote
 }
 
-func TestSplitHeaderLine(t *testing.T) {
-	for _, tc := range []struct {
-		line        string
-		name, value string
-		ok          bool
-	}{
-		{"Host: example.com\r\n", "host", " example.com", true},
-		{"X-A:v\r\n", "x-a", "v", true},
-		{"X-A: v: w\r\n", "x-a", " v: w", true},
-		{"X-A : v\r\n", "", "", false},
-		{" folded\r\n", "", "", false},
-		{"\tfolded: v\r\n", "", "", false},
-		{"no-colon-line\r\n", "", "", false},
-		{": v\r\n", "", "", false},
-		{"X@A: v\r\n", "", "", false},
-		{"X\x00A: v\r\n", "", "", false},
-		{"X-A: a\rEvil: b\r\n", "", "", false},
-		{"X-A: a\x00b\r\n", "", "", false},
-		{"X-A: a\x7fb\r\n", "", "", false},
-	} {
-		name, value, ok := splitHeaderLine(tc.line)
-		if name != tc.name || value != tc.value || ok != tc.ok {
-			t.Errorf("splitHeaderLine(%q) = (%q, %q, %v), want (%q, %q, %v)",
-				tc.line, name, value, ok, tc.name, tc.value, tc.ok)
-		}
-	}
-}
-
 func TestHandleHTTPPlainRejectsMalformedHeaders(t *testing.T) {
 	skipIfShortNetwork(t)
 
@@ -1093,7 +1065,6 @@ func TestHandleHTTPPlainRejectsMalformedHeaders(t *testing.T) {
 		name   string
 		header string
 	}{
-		{"obs-fold continuation", "X-A: first\r\n second\r\n"},
 		{"space before colon", "X-A : v\r\n"},
 		{"no colon", "garbage\r\n"},
 		{"empty name", ": v\r\n"},
@@ -1105,9 +1076,11 @@ func TestHandleHTTPPlainRejectsMalformedHeaders(t *testing.T) {
 			proxyAddr := startHTTPProxyStack(t, "")
 			conn := dialHTTPProxy(t, proxyAddr)
 
-			// No terminating blank line: the handler rejects at the bad
-			// header, and unread bytes would risk a RST eating the reply.
-			fmt.Fprintf(conn, "GET http://%s/ HTTP/1.1\r\nHost: %s\r\n%s", targetAddr, targetAddr, tc.header)
+			// The terminating blank line is required: textproto needs it
+			// both to look for continuation lines after a header and to
+			// finish the section before the space-in-key case is caught
+			// by the post-parse validation.
+			fmt.Fprintf(conn, "GET http://%s/ HTTP/1.1\r\nHost: %s\r\n%s\r\n", targetAddr, targetAddr, tc.header)
 
 			if status := readProxyStatus(t, conn); status != 400 {
 				t.Fatalf("unexpected status: %d", status)
@@ -1116,45 +1089,119 @@ func TestHandleHTTPPlainRejectsMalformedHeaders(t *testing.T) {
 	}
 }
 
-func TestHandleHTTPPlainRejectsTooManyHeaderLines(t *testing.T) {
-	skipIfShortNetwork(t)
+func TestHandleHTTPConnectRejectsOversizedHeaders(t *testing.T) {
+	client, done := startHandleHTTPSession(t, newTestProxy(unreachableTargetAddr))
 
-	targetAddr := unreachableTargetAddr
-	proxyAddr := startHTTPProxyStack(t, "")
-	conn := dialHTTPProxy(t, proxyAddr)
-
-	// Host plus maxHTTPHeaderLines more lines: the limit trips on the
-	// last one, so the handler consumes every byte sent (no RST risk).
-	var payload bytes.Buffer
-	fmt.Fprintf(&payload, "GET http://%s/ HTTP/1.1\r\nHost: %s\r\n", targetAddr, targetAddr)
-	for i := range maxHTTPHeaderLines {
-		fmt.Fprintf(&payload, "X-N-%d: v\r\n", i)
-	}
-	if _, err := conn.Write(payload.Bytes()); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-
-	if status := readProxyStatus(t, conn); status != 431 {
-		t.Fatalf("unexpected status: %d", status)
-	}
-}
-
-func TestHandleHTTPConnectRejectsTooManyHeaderLines(t *testing.T) {
-	client, done := startHandleHTTPSession(t, newTestProxy("127.0.0.1:9"))
-
+	// Write concurrently: it blocks once the handler's buffer fills,
+	// leaving this goroutine free to read the 431.
 	var payload bytes.Buffer
 	payload.WriteString("CONNECT example.com:443 HTTP/1.1\r\n")
-	for i := 0; i <= maxHTTPHeaderLines; i++ {
-		fmt.Fprintf(&payload, "X-N-%d: v\r\n", i)
+	pad := strings.Repeat("a", 4<<10)
+	for i := 0; payload.Len() <= maxHTTPHeaderBytes; i++ {
+		fmt.Fprintf(&payload, "X-Pad-%d: %s\r\n", i, pad)
 	}
-	if _, err := client.Write(payload.Bytes()); err != nil {
-		t.Fatalf("write: %v", err)
-	}
+	wrote := make(chan struct{})
+	go func() {
+		defer close(wrote)
+		client.Write(payload.Bytes())
+	}()
 
 	if status := readProxyStatus(t, client); status != 431 {
 		t.Fatalf("unexpected status: %d", status)
 	}
 	waitDone(t, done)
+	<-wrote
+}
+
+func TestHandleHTTPRejectsSmugglingHeaders(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		headers string
+	}{
+		{"multiple Host headers", "Host: a.example\r\nHost: b.example\r\n"},
+		{"differing duplicate Content-Length", "Host: example.com\r\nContent-Length: 1\r\nContent-Length: 2\r\n"},
+		{"invalid Content-Length", "Host: example.com\r\nContent-Length: abc\r\n"},
+		{"unsupported Transfer-Encoding", "Host: example.com\r\nTransfer-Encoding: gzip\r\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, done := startHandleHTTPSession(t, newTestProxy("127.0.0.1:9"))
+
+			fmt.Fprintf(client, "GET http://example.com/ HTTP/1.1\r\n%s\r\n", tc.headers)
+
+			if status := readProxyStatus(t, client); status != 400 {
+				t.Fatalf("unexpected status: %d", status)
+			}
+			waitDone(t, done)
+		})
+	}
+}
+
+func TestHandleHTTPRejectsLowercaseConnect(t *testing.T) {
+	client, done := startHandleHTTPSession(t, newTestProxy("127.0.0.1:9"))
+
+	// Methods are case-sensitive (RFC 9110 §9.1): lowercase connect is
+	// not CONNECT, and its authority-form target is not absolute-form
+	// http, so the plain path rejects it.
+	fmt.Fprintf(client, "connect example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+
+	if status := readProxyStatus(t, client); status != 400 {
+		t.Fatalf("unexpected status: %d", status)
+	}
+	waitDone(t, done)
+}
+
+func TestHandleHTTPPlainDropsContentLengthWithChunked(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	// A message with both framings is a smuggling vector; the proxy must
+	// forward only the chunked framing (RFC 9112 §6.1).
+	targetAddr := startRawCaptureTarget(t)
+	proxyAddr := startHTTPProxyStack(t, "")
+	conn := dialHTTPProxy(t, proxyAddr)
+	fmt.Fprintf(conn, "POST http://%s/ HTTP/1.1\r\nHost: %s\r\nTransfer-Encoding: chunked\r\nContent-Length: 7\r\n\r\n2\r\nhi\r\n0\r\n\r\n", targetAddr, targetAddr)
+
+	body := readProxyResponseBody(t, conn)
+	if strings.Contains(body, "Content-Length") {
+		t.Fatalf("Content-Length was forwarded alongside chunked: %s", body)
+	}
+	if !strings.Contains(body, "Transfer-Encoding: chunked\r\n") {
+		t.Fatalf("Transfer-Encoding was not forwarded: %s", body)
+	}
+}
+
+func TestHandleHTTPPlainRegeneratesHostFromURI(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	targetAddr := startRawCaptureTarget(t)
+	proxyAddr := startHTTPProxyStack(t, "")
+	conn := dialHTTPProxy(t, proxyAddr)
+	// The client's Host header contradicts the absolute-form target; the
+	// proxy must regenerate Host from the URI (RFC 7230 §5.4).
+	fmt.Fprintf(conn, "GET http://%s/ HTTP/1.1\r\nHost: evil.example\r\n\r\n", targetAddr)
+
+	body := readProxyResponseBody(t, conn)
+	if !strings.Contains(body, "Host: "+targetAddr+"\r\n") {
+		t.Fatalf("Host was not regenerated from the URI: %s", body)
+	}
+	if strings.Contains(body, "evil.example") {
+		t.Fatalf("client-supplied Host leaked: %s", body)
+	}
+}
+
+func TestHandleHTTPPlainNormalizesObsFold(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	targetAddr := startRawCaptureTarget(t)
+	proxyAddr := startHTTPProxyStack(t, "")
+	conn := dialHTTPProxy(t, proxyAddr)
+	// An obs-fold continuation must never be forwarded verbatim; it is
+	// joined with a single space before forwarding (RFC 7230 §3.2.4).
+	fmt.Fprintf(conn, "GET http://%s/ HTTP/1.1\r\nHost: %s\r\nX-A: first\r\n second\r\n\r\n", targetAddr, targetAddr)
+
+	body := readProxyResponseBody(t, conn)
+	if !strings.Contains(body, "X-A: first second\r\n") {
+		t.Fatalf("obs-fold was not normalized to a space-joined value: %s", body)
+	}
 }
 
 func TestHandleHTTPPlainForcesConnectionClose(t *testing.T) {
@@ -1259,10 +1306,13 @@ func TestHandleHTTPPlainSecondRequestNotMisrouted(t *testing.T) {
 func TestHandleHTTPRejectsInvalidProto(t *testing.T) {
 	client, done := startHandleHTTPSession(t, newTestProxy("127.0.0.1:9"))
 
-	// Send a request with a bogus protocol version.
+	// Send a request with an unsupported protocol version.
 	fmt.Fprintf(client, "GET / HTTP/2.0\r\nHost: example.com\r\n\r\n")
 
-	// The handler should close the connection because proto is not HTTP/1.0 or HTTP/1.1.
+	// The handler closes the connection without a response.
+	if _, err := bufio.NewReader(client).ReadByte(); err != io.EOF {
+		t.Fatalf("expected silent close, got %v", err)
+	}
 	waitDone(t, done)
 }
 
@@ -1272,7 +1322,9 @@ func TestHandleHTTPRejectsNonTokenMethod(t *testing.T) {
 	// Send a request whose method is not a valid token.
 	fmt.Fprintf(client, "GE\x00T / HTTP/1.1\r\nHost: example.com\r\n\r\n")
 
-	// The handler should close the connection because the method is not a token.
+	if status := readProxyStatus(t, client); status != 400 {
+		t.Fatalf("unexpected status: %d", status)
+	}
 	waitDone(t, done)
 }
 
@@ -1319,33 +1371,23 @@ func TestHandleHTTPPlainRejectsNonHTTPScheme(t *testing.T) {
 	}
 }
 
-func TestHandleHTTPRejectsOversizedLine(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		prefix string
-	}{
-		{"request line", "GET /"},
-		{"connect header", "CONNECT example.com:443 HTTP/1.1\r\nX-Pad: "},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			client, done := startHandleHTTPSession(t, newTestProxy("127.0.0.1:9"))
+func TestHandleHTTPRejectsOversizedRequestLine(t *testing.T) {
+	client, done := startHandleHTTPSession(t, newTestProxy("127.0.0.1:9"))
 
-			// Write concurrently: it blocks once the handler's buffer fills,
-			// leaving this goroutine free to read the 431.
-			payload := append([]byte(tc.prefix), bytes.Repeat([]byte("a"), maxHTTPLineLength+1)...)
-			wrote := make(chan struct{})
-			go func() {
-				defer close(wrote)
-				client.Write(payload)
-			}()
+	// Write concurrently: it blocks once the handler's buffer fills,
+	// leaving this goroutine free to read the 431.
+	payload := append([]byte("GET /"), bytes.Repeat([]byte("a"), maxHTTPHeaderBytes+1)...)
+	wrote := make(chan struct{})
+	go func() {
+		defer close(wrote)
+		client.Write(payload)
+	}()
 
-			if status := readProxyStatus(t, client); status != 431 {
-				t.Fatalf("unexpected status: %d", status)
-			}
-			waitDone(t, done)
-			<-wrote
-		})
+	if status := readProxyStatus(t, client); status != 431 {
+		t.Fatalf("unexpected status: %d", status)
 	}
+	waitDone(t, done)
+	<-wrote
 }
 
 func TestHandleHTTPConnectFallsBackToDirect(t *testing.T) {
@@ -1482,6 +1524,39 @@ func startHeaderEchoTarget(t *testing.T, describe func(*http.Request) string) st
 				}
 				body := describe(req)
 				fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+			}(conn)
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// startRawCaptureTarget starts a target that reads one raw request header
+// section and echoes it verbatim as the response body, so tests can assert
+// on the exact bytes the proxy forwarded.
+func startRawCaptureTarget(t *testing.T) string {
+	t.Helper()
+	ln := mustListenLoopback(t, "target")
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				var raw bytes.Buffer
+				for {
+					line, err := br.ReadString('\n')
+					if err != nil {
+						return
+					}
+					if line == "\r\n" {
+						break
+					}
+					raw.WriteString(line)
+				}
+				fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", raw.Len(), raw.String())
 			}(conn)
 		}
 	}()

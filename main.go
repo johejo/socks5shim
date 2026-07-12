@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
+	"net/http"
 	"net/netip"
-	"net/url"
+	"net/textproto"
 	"runtime/debug"
 	"slices"
 	"strconv"
@@ -57,30 +59,33 @@ const (
 	directDialTimeout             = 10 * time.Second
 	upstreamUnavailableBackoff    = 3 * time.Second
 
-	maxHTTPLineLength  = 8 << 10
+	// maxHTTPHeaderBytes bounds the request line plus header section.
+	// http.ReadRequest reads without bound, so the limit is imposed below
+	// the bufio.Reader, mirroring net/http.Server's MaxHeaderBytes.
 	maxHTTPHeaderBytes = 64 << 10
-	maxHTTPHeaderLines = 100
+	httpReadBufferSize = 8 << 10
 )
 
 var errAddressTypeNotSupported = errors.New("address type not supported")
-var errHTTPLineTooLong = errors.New("http line too long")
-var errMalformedHeader = errors.New("malformed header line")
 var errUpstreamUnavailable = errors.New("upstream unavailable")
 var errUpstreamProtocol = errors.New("upstream protocol error")
 var errUnknownReplyAddressType = errors.New("unknown reply address type")
 
 // hopByHopHeaders is the RFC-defined hop-by-hop set (RFC 7230 §6.1 /
-// RFC 2616 §13.5.1) minus Transfer-Encoding: the body is relayed as raw
-// bytes, so its framing must reach the origin intact.
+// RFC 2616 §13.5.1), keyed by canonical MIME casing to match req.Header.
+// Transfer-Encoding never appears here: http.ReadRequest moves it to
+// req.TransferEncoding, and writeProxiedRequest re-emits it because the
+// body is relayed as raw bytes, so its framing must reach the origin
+// intact.
 var hopByHopHeaders = map[string]bool{
-	"connection":          true,
-	"proxy-connection":    true,
-	"keep-alive":          true,
-	"proxy-authorization": true,
-	"proxy-authenticate":  true,
-	"te":                  true,
-	"trailer":             true,
-	"upgrade":             true,
+	"Connection":          true,
+	"Proxy-Connection":    true,
+	"Keep-Alive":          true,
+	"Proxy-Authorization": true,
+	"Proxy-Authenticate":  true,
+	"Te":                  true,
+	"Trailer":             true,
+	"Upgrade":             true,
 }
 
 var version string
@@ -606,87 +611,64 @@ func (p *proxy) handleHTTP(client net.Conn) {
 		return
 	}
 
-	br := bufio.NewReaderSize(client, maxHTTPLineLength)
-	requestLine, err := readHTTPLine(br)
+	lr := &io.LimitedReader{R: client, N: maxHTTPHeaderBytes}
+	br := bufio.NewReaderSize(lr, httpReadBufferSize)
+	req, err := http.ReadRequest(br)
 	if err != nil {
-		respondLineTooLong(client, "HTTP/1.1", err)
+		// Check the limit first: an exhausted budget surfaces as an
+		// io error, the same ambiguity-resolution order as net/http.
+		if lr.N <= 0 {
+			httpRespond(client, "HTTP/1.1", "431 Request Header Fields Too Large")
+		} else if !isNetReadError(err) {
+			httpRespond(client, "HTTP/1.1", "400 Bad Request")
+		}
 		return
 	}
-	requestLine = strings.TrimRight(requestLine, "\r\n")
+	// lr only guards the header section; the body bypasses it because
+	// relay reads the raw connection.
 
-	parts := strings.SplitN(requestLine, " ", 3)
-	if len(parts) != 3 {
-		return
-	}
-	method, uri, proto := parts[0], parts[1], parts[2]
-
-	// A method is a token (RFC 9110 §9.1), the same grammar ValidHeaderFieldName checks.
-	if !httpguts.ValidHeaderFieldName(method) {
-		return
-	}
-
-	// Validate protocol version to prevent header injection.
-	if proto != "HTTP/1.0" && proto != "HTTP/1.1" {
+	if req.ProtoMajor != 1 {
 		return
 	}
 
-	if strings.ToUpper(method) == "CONNECT" {
-		p.handleHTTPConnect(client, br, uri, proto)
+	// textproto accepts field names ReadRequest never re-checks, e.g.
+	// "Host " (space before colon) slips past its exact-match Host
+	// deletion and would be forwarded verbatim. Re-validate every field
+	// the way net/http.Server does before anything reaches the origin.
+	for k, vv := range req.Header {
+		if !httpguts.ValidHeaderFieldName(k) {
+			httpRespond(client, req.Proto, "400 Bad Request")
+			return
+		}
+		for _, v := range vv {
+			if !httpguts.ValidHeaderFieldValue(v) {
+				httpRespond(client, req.Proto, "400 Bad Request")
+				return
+			}
+		}
+	}
+
+	if req.Method == "CONNECT" {
+		p.handleHTTPConnect(client, br, req)
 	} else {
-		p.handleHTTPPlain(client, br, method, uri, proto)
+		p.handleHTTPPlain(client, br, req)
 	}
 }
 
-// readHTTPLine reads one line, failing instead of buffering unboundedly
-// when no newline arrives within the reader's buffer size.
-func readHTTPLine(br *bufio.Reader) (string, error) {
-	line, err := br.ReadSlice('\n')
-	if err == bufio.ErrBufferFull {
-		return "", errHTTPLineTooLong
+// isNetReadError reports whether err came from the transport (client hung
+// up or the read deadline fired) rather than from parsing, in which case
+// no response should be attempted.
+func isNetReadError(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
 	}
-	if err != nil {
-		return "", err
-	}
-	return string(line), nil
-}
-
-// respondLineTooLong writes a best-effort 431 if err is errHTTPLineTooLong.
-func respondLineTooLong(client net.Conn, proto string, err error) {
-	if errors.Is(err, errHTTPLineTooLong) {
-		httpRespond(client, proto, "431 Request Header Fields Too Large")
-	}
+	var ne net.Error
+	return errors.As(err, &ne)
 }
 
 // httpRespond writes a best-effort minimal status-line-only response.
 func httpRespond(w io.Writer, proto, status string) {
 	fmt.Fprintf(w, "%s %s\r\n\r\n", proto, status)
-}
-
-// forEachHeaderLine reads header lines up to the blank terminator, bounding
-// total size and line count so a client cannot stream junk until the read
-// deadline. fn (if non-nil) runs on each line as it arrives, so callers can
-// reject a bad header without waiting for the rest of the section.
-func forEachHeaderLine(br *bufio.Reader, fn func(line string) error) error {
-	var totalBytes, count int
-	for {
-		line, err := readHTTPLine(br)
-		if err != nil {
-			return err
-		}
-		if strings.TrimRight(line, "\r\n") == "" {
-			return nil
-		}
-		totalBytes += len(line)
-		count++
-		if totalBytes > maxHTTPHeaderBytes || count > maxHTTPHeaderLines {
-			return errHTTPLineTooLong
-		}
-		if fn != nil {
-			if err := fn(line); err != nil {
-				return err
-			}
-		}
-	}
 }
 
 // relayBuffered flushes any bytes already buffered by br to remote, then
@@ -702,16 +684,10 @@ func relayBuffered(client, remote net.Conn, br *bufio.Reader) {
 	relay(client, remote)
 }
 
-func (p *proxy) handleHTTPConnect(client net.Conn, br *bufio.Reader, uri, proto string) {
-	// Headers are read only to find the end of the request.
-	if err := forEachHeaderLine(br, nil); err != nil {
-		respondLineTooLong(client, proto, err)
-		return
-	}
-
-	host, port, err := parseHostPort(uri, "443")
+func (p *proxy) handleHTTPConnect(client net.Conn, br *bufio.Reader, req *http.Request) {
+	host, port, err := parseHostPort(req.Host, "443")
 	if err != nil {
-		httpRespond(client, proto, "400 Bad Request")
+		httpRespond(client, req.Proto, "400 Bad Request")
 		return
 	}
 
@@ -719,7 +695,7 @@ func (p *proxy) handleHTTPConnect(client net.Conn, br *bufio.Reader, uri, proto 
 	remote, viaUpstream, err := p.dial(target)
 	if err != nil {
 		log.Printf("HTTP CONNECT FAIL %s: %v", target.addr, err)
-		httpRespond(client, proto, "502 Bad Gateway")
+		httpRespond(client, req.Proto, "502 Bad Gateway")
 		return
 	}
 	defer remote.Close()
@@ -733,55 +709,21 @@ func (p *proxy) handleHTTPConnect(client net.Conn, br *bufio.Reader, uri, proto 
 	if err := client.SetReadDeadline(time.Time{}); err != nil {
 		return
 	}
-	httpRespond(client, proto, "200 Connection established")
+	httpRespond(client, req.Proto, "200 Connection established")
 
 	relayBuffered(client, remote, br)
 }
 
-func (p *proxy) handleHTTPPlain(client net.Conn, br *bufio.Reader, method, uri, proto string) {
-	u, err := url.Parse(uri)
-	if err != nil || u.Scheme != "http" || u.Host == "" {
-		httpRespond(client, proto, "400 Bad Request")
+func (p *proxy) handleHTTPPlain(client net.Conn, br *bufio.Reader, req *http.Request) {
+	// Only absolute-form targets are accepted, as a proxy should.
+	if req.URL.Scheme != "http" || req.URL.Host == "" {
+		httpRespond(client, req.Proto, "400 Bad Request")
 		return
 	}
 
-	host, port, err := parseHostPort(u.Host, "80")
+	host, port, err := parseHostPort(req.URL.Host, "80")
 	if err != nil {
-		httpRespond(client, proto, "400 Bad Request")
-		return
-	}
-
-	// Collect headers so hop-by-hop ones can be dropped — both the
-	// well-known set and any nominated by Connection (RFC 7230 §6.1). A
-	// nomination may appear after the header it names, which is why
-	// forwarding waits until the whole section is read.
-	type headerLine struct {
-		raw  string
-		name string
-	}
-	var headerLines []headerLine
-	nominated := map[string]bool{}
-	err = forEachHeaderLine(br, func(line string) error {
-		name, value, ok := splitHeaderLine(line)
-		if !ok {
-			return errMalformedHeader
-		}
-		headerLines = append(headerLines, headerLine{raw: line, name: name})
-		if name == "connection" || name == "proxy-connection" {
-			for tok := range strings.SplitSeq(value, ",") {
-				if tok = strings.ToLower(strings.TrimSpace(tok)); tok != "" {
-					nominated[tok] = true
-				}
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		if errors.Is(err, errMalformedHeader) {
-			httpRespond(client, proto, "400 Bad Request")
-		} else {
-			respondLineTooLong(client, proto, err)
-		}
+		httpRespond(client, req.Proto, "400 Bad Request")
 		return
 	}
 
@@ -789,7 +731,7 @@ func (p *proxy) handleHTTPPlain(client net.Conn, br *bufio.Reader, method, uri, 
 	remote, viaUpstream, err := p.dial(target)
 	if err != nil {
 		log.Printf("HTTP PLAIN FAIL %s: %v", target.addr, err)
-		httpRespond(client, proto, "502 Bad Gateway")
+		httpRespond(client, req.Proto, "502 Bad Gateway")
 		return
 	}
 	defer remote.Close()
@@ -800,19 +742,7 @@ func (p *proxy) handleHTTPPlain(client net.Conn, br *bufio.Reader, method, uri, 
 		log.Printf("HTTP PLAIN DIRECT %s -> %s", target.addr, remote.RemoteAddr())
 	}
 
-	// Rewrite the request line to a relative path and force
-	// Connection: close so neither side reuses the connection; relay()
-	// forwards raw bytes and cannot route a second request.
-	var req strings.Builder
-	fmt.Fprintf(&req, "%s %s %s\r\n", method, u.RequestURI(), proto)
-	for _, h := range headerLines {
-		if hopByHopHeaders[h.name] || nominated[h.name] {
-			continue
-		}
-		req.WriteString(h.raw)
-	}
-	req.WriteString("Connection: close\r\n\r\n")
-	if _, err := io.WriteString(remote, req.String()); err != nil {
+	if err := writeProxiedRequest(remote, req); err != nil {
 		return
 	}
 
@@ -823,18 +753,44 @@ func (p *proxy) handleHTTPPlain(client net.Conn, br *bufio.Reader, method, uri, 
 	relayBuffered(client, remote, br)
 }
 
-// splitHeaderLine splits a raw header line into its lowercased field name
-// and raw value. Non-token names (covers obs-fold continuations and
-// space-before-colon) and control bytes in the value (notably a bare CR,
-// which some origins treat as a line terminator) are rejected: forwarding
-// them verbatim invites the origin to parse the request differently than
-// this proxy did.
-func splitHeaderLine(line string) (name, value string, ok bool) {
-	name, value, found := strings.Cut(strings.TrimRight(line, "\r\n"), ":")
-	if !found || !httpguts.ValidHeaderFieldName(name) || !httpguts.ValidHeaderFieldValue(value) {
-		return "", "", false
+// writeProxiedRequest re-serializes req with an origin-form request line,
+// dropping hop-by-hop headers — both the well-known set and any nominated
+// by Connection (RFC 7230 §6.1) — and forcing Connection: close so neither
+// side reuses the connection; relay() forwards raw bytes and cannot route
+// a second request. Host and Transfer-Encoding live outside req.Header
+// after parsing and are re-emitted explicitly: the Host value comes from
+// the absolute-form target (RFC 7230 §5.4), and Transfer-Encoding must
+// survive because the body is relayed as raw, already chunk-framed bytes.
+func writeProxiedRequest(w io.Writer, req *http.Request) error {
+	drop := maps.Clone(hopByHopHeaders)
+	for _, field := range []string{"Connection", "Proxy-Connection"} {
+		for _, v := range req.Header.Values(field) {
+			for tok := range strings.SplitSeq(v, ",") {
+				if tok = strings.TrimSpace(tok); tok != "" {
+					drop[textproto.CanonicalMIMEHeaderKey(tok)] = true
+				}
+			}
+		}
 	}
-	return strings.ToLower(name), value, true
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s %s %s\r\n", req.Method, req.URL.RequestURI(), req.Proto)
+	fmt.Fprintf(&b, "Host: %s\r\n", req.Host)
+	if len(req.TransferEncoding) > 0 {
+		b.WriteString("Transfer-Encoding: chunked\r\n")
+	}
+	for _, k := range slices.Sorted(maps.Keys(req.Header)) {
+		if drop[k] {
+			continue
+		}
+		// One line per value: comma-joining would corrupt Cookie.
+		for _, v := range req.Header[k] {
+			fmt.Fprintf(&b, "%s: %s\r\n", k, v)
+		}
+	}
+	b.WriteString("Connection: close\r\n\r\n")
+	_, err := io.WriteString(w, b.String())
+	return err
 }
 
 func parseHostPort(hostport, defaultPort string) (string, uint16, error) {
