@@ -71,7 +71,7 @@ func (p *proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	target := buildHTTPTarget(host, port)
-	remote, viaUpstream, err := p.dial(target, nil)
+	remote, viaUpstream, err := p.dial(r.Context(), target, nil)
 	if err != nil {
 		log.Printf("HTTP CONNECT FAIL %s: %v", target.addr, err)
 		http.Error(w, "dial failed", http.StatusBadGateway)
@@ -104,16 +104,15 @@ func (p *proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 	relayBuffered(conn, remote, brw.Reader)
 }
 
-// dialContext adapts the SOCKS5-or-direct dial path to http.Transport.
-// ctx is not consulted: p.dial bounds itself with its own timeouts, so a
-// canceled request at worst leaks a dial for their sum.
-func (p *proxy) dialContext(_ context.Context, _, addr string) (net.Conn, error) {
+// dialContext adapts the SOCKS5-or-direct dial path to http.Transport. The
+// request ctx is honored; see dial for its cancellation behavior.
+func (p *proxy) dialContext(ctx context.Context, _, addr string) (net.Conn, error) {
 	host, port, err := parseHostPort(addr, "80")
 	if err != nil {
 		return nil, err
 	}
 	target := buildHTTPTarget(host, port)
-	remote, viaUpstream, err := p.dial(target, nil)
+	remote, viaUpstream, err := p.dial(ctx, target, nil)
 	if err != nil {
 		return nil, err
 	}

@@ -42,6 +42,48 @@ func TestHandleHTTPConnect(t *testing.T) {
 	}
 }
 
+// TestHandleHTTPConnectClientDisconnectUnblocksHandler pins the payoff of
+// threading r.Context() into dial, including the stdlib guarantee it rests
+// on (the Server cancels the request context when the client disconnects):
+// a CONNECT client that gives up mid-dial frees the handler promptly instead
+// of holding it for the whole connect budget.
+func TestHandleHTTPConnectClientDisconnectUnblocksHandler(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	targetLn := mustListenLoopback(t, "target")
+	target := targetFromListener(t, targetLn)
+
+	// Upstream completes the greeting, signals that the CONNECT request
+	// arrived, then stalls the reply.
+	dialing := make(chan struct{})
+	upstreamAddr, _ := startScriptedUpstream(t, target, func(conn net.Conn) error {
+		close(dialing)
+		io.Copy(io.Discard, conn)
+		return nil
+	})
+
+	p := newTestProxy(upstreamAddr)
+	// A budget far beyond the assertion window, so a prompt handler exit can
+	// only come from cancellation, not from the dial timing out.
+	p.connectTimeout = 5 * time.Second
+
+	client, done := startHandleHTTPSession(t, p)
+	fmt.Fprintf(client, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target.addr, target.addr)
+
+	select {
+	case <-dialing:
+	case <-time.After(testIOTimeout):
+		t.Fatal("upstream never saw the CONNECT request")
+	}
+	client.Close()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("handler still blocked in dial after client disconnect")
+	}
+}
+
 func TestHandleHTTPPlainGET(t *testing.T) {
 	skipIfShortNetwork(t)
 

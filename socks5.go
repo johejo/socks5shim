@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -139,7 +140,11 @@ func (p *proxy) handle(client net.Conn) {
 	}
 
 	// --- Try upstream, fallback to direct ---
-	remote, viaUpstream, err := p.dial(target, creds)
+	// No cancel source exists on the SOCKS5 path (no graceful shutdown, and
+	// watching the client for disconnect would consume bytes an eager client
+	// pipelines behind the CONNECT request); dial bounds itself with its own
+	// timeouts.
+	remote, viaUpstream, err := p.dial(context.Background(), target, creds)
 	if err != nil {
 		log.Printf("FAIL %s: %v", target.addr, err)
 		var upstreamErr upstreamConnectError
@@ -245,6 +250,7 @@ func readTarget(r io.Reader, atyp byte) (socks5Target, error) {
 // dialUpstream performs a full SOCKS5 handshake with the upstream proxy.
 // p.dialTimeout covers TCP connect + greeting; p.connectTimeout covers the
 // CONNECT request/reply (includes the upstream-side dial to the target).
+// It deliberately takes no ctx; dial handles cancellation (see its doc).
 func (p *proxy) dialUpstream(target socks5Target, creds *socks5Creds) (net.Conn, error) {
 	helloTimeout := p.dialTimeout
 	if helloTimeout <= 0 {

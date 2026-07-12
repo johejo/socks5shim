@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -129,26 +130,66 @@ func replyCodeFromDialError(err error) byte {
 }
 
 // dial tries the upstream SOCKS5 proxy first; on failure, connects directly.
-func (p *proxy) dial(target socks5Target, creds *socks5Creds) (net.Conn, bool, error) {
+// Canceling ctx unblocks the caller promptly. An in-flight upstream handshake
+// is not torn down on cancel: a cancel proves nothing about the upstream, so
+// the handshake rides out its own deadlines detached (like http.Transport's
+// abandoned dials) and its verdict still settles the backoff cache.
+func (p *proxy) dial(ctx context.Context, target socks5Target, creds *socks5Creds) (net.Conn, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
 	if p.backoff.shouldSkip(p.upstream, time.Now()) {
-		return dialDirect(target)
+		return dialDirect(ctx, target)
 	}
 
-	conn, err := p.dialUpstream(target, creds)
+	type upstreamResult struct {
+		conn net.Conn
+		err  error
+	}
+	ch := make(chan upstreamResult, 1)
+	go func() {
+		conn, err := p.dialUpstream(target, creds)
+		ch <- upstreamResult{conn, err}
+	}()
+
+	var conn net.Conn
+	var err error
+	select {
+	case r := <-ch:
+		conn, err = r.conn, r.err
+	case <-ctx.Done():
+		// Nobody is waiting for a fallback either; just settle the backoff
+		// cache once the abandoned handshake resolves.
+		go func() {
+			r := <-ch
+			switch {
+			case r.err == nil:
+				p.backoff.clear(p.upstream)
+				r.conn.Close()
+			case errors.As(r.err, new(upstreamConnectError)):
+				p.backoff.clear(p.upstream) // upstream alive; same as attended path below
+			case errors.Is(r.err, errUpstreamUnavailable):
+				p.backoff.markUnavailable(p.upstream, time.Now())
+				log.Printf("upstream unavailable: %v (abandoned by canceled request)", r.err)
+			}
+		}()
+		return nil, false, ctx.Err()
+	}
+
 	if err == nil {
 		p.backoff.clear(p.upstream)
 		return conn, true, nil
 	}
 	var connectErr upstreamConnectError
 	if errors.As(err, &connectErr) {
+		// Any CONNECT reply proves the greeting succeeded, i.e. the upstream
+		// is alive, so clear any backoff mark whether or not we fall back.
+		p.backoff.clear(p.upstream)
 		if !connectErr.fallbackEligible(p.fallbackGeneralFailure) {
 			return nil, false, err
 		}
-		// The greeting succeeded, so the upstream is alive: fall back
-		// without poisoning the backoff cache.
-		p.backoff.clear(p.upstream)
 		log.Printf("upstream CONNECT failed (rep=0x%02x) for %s; falling back to direct", connectErr.rep, target.addr)
-		return dialDirect(target)
+		return dialDirect(ctx, target)
 	}
 	// errUpstreamAuth and errUpstreamProtocol land here: deliberate
 	// rejections must not be bypassed via a direct fallback.
@@ -160,11 +201,11 @@ func (p *proxy) dial(target socks5Target, creds *socks5Creds) (net.Conn, bool, e
 	// doesn't stall every connection for connectTimeout.
 	p.backoff.markUnavailable(p.upstream, time.Now())
 	log.Printf("upstream unavailable: %v; falling back to direct", err)
-	return dialDirect(target)
+	return dialDirect(ctx, target)
 }
 
-func dialDirect(target socks5Target) (net.Conn, bool, error) {
-	conn, err := net.DialTimeout("tcp", target.addr, directDialTimeout)
+func dialDirect(ctx context.Context, target socks5Target) (net.Conn, bool, error) {
+	conn, err := (&net.Dialer{Timeout: directDialTimeout}).DialContext(ctx, "tcp", target.addr)
 	if err != nil {
 		return nil, false, err
 	}

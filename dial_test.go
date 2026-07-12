@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -62,7 +63,7 @@ func TestDialDoesNotFallbackOnUpstreamAuthRejection(t *testing.T) {
 			upstreamAddr, serverErr := startScriptedUpstreamHandshake(t, target, handshake, func(net.Conn) error { return nil })
 
 			p := newTestProxy(upstreamAddr)
-			conn, viaUpstream, err := p.dial(target, &socks5Creds{username: "user", password: "wrong"})
+			conn, viaUpstream, err := p.dial(context.Background(), target, &socks5Creds{username: "user", password: "wrong"})
 			if conn != nil {
 				conn.Close()
 				t.Fatal("expected nil conn on upstream auth rejection")
@@ -164,6 +165,21 @@ type dialFallbackFixture struct {
 // dialer gives up and closes the connection.
 func startDialFallbackFixture(t *testing.T, connectReply []byte) dialFallbackFixture {
 	t.Helper()
+	return startDialFallbackFixtureScript(t, func(conn net.Conn) error {
+		if len(connectReply) == 0 {
+			// Stall until the dialer times out and closes the connection.
+			io.Copy(io.Discard, conn)
+			return nil
+		}
+		_, err := conn.Write(connectReply)
+		return err
+	})
+}
+
+// startDialFallbackFixtureScript is startDialFallbackFixture with a custom
+// post-CONNECT upstream script.
+func startDialFallbackFixtureScript(t *testing.T, script func(net.Conn) error) dialFallbackFixture {
+	t.Helper()
 
 	targetLn := mustListenLoopback(t, "target")
 	target := targetFromListener(t, targetLn)
@@ -177,15 +193,7 @@ func startDialFallbackFixture(t *testing.T, connectReply []byte) dialFallbackFix
 		}
 	}()
 
-	upstreamAddr, serverErr := startScriptedUpstream(t, target, func(conn net.Conn) error {
-		if len(connectReply) == 0 {
-			// Stall until the dialer times out and closes the connection.
-			io.Copy(io.Discard, conn)
-			return nil
-		}
-		_, err := conn.Write(connectReply)
-		return err
-	})
+	upstreamAddr, serverErr := startScriptedUpstream(t, target, script)
 
 	return dialFallbackFixture{
 		p:         newTestProxy(upstreamAddr),
@@ -200,7 +208,7 @@ func startDialFallbackFixture(t *testing.T, connectReply []byte) dialFallbackFix
 func (fx dialFallbackFixture) assertDirectFallback(t *testing.T) {
 	t.Helper()
 
-	conn, viaUpstream, err := fx.p.dial(fx.target, nil)
+	conn, viaUpstream, err := fx.p.dial(context.Background(), fx.target, nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -224,7 +232,7 @@ func (fx dialFallbackFixture) assertDirectFallback(t *testing.T) {
 func (fx dialFallbackFixture) assertNoFallback(t *testing.T, wantRep byte) {
 	t.Helper()
 
-	conn, viaUpstream, err := fx.p.dial(fx.target, nil)
+	conn, viaUpstream, err := fx.p.dial(context.Background(), fx.target, nil)
 	if conn != nil {
 		conn.Close()
 		t.Fatalf("expected nil conn on upstream CONNECT failure")
@@ -247,6 +255,231 @@ func (fx dialFallbackFixture) assertNoFallback(t *testing.T, wantRep byte) {
 	}
 }
 
+// TestDialCanceledDuringUpstreamHandshake guards the cancellation contract:
+// a canceled request returns promptly and never falls back to direct, while
+// the abandoned handshake rides out its own deadline in the background —
+// here the upstream stalls the CONNECT reply, so the abandoned dial's
+// timeout must still mark the upstream for backoff.
+func TestDialCanceledDuringUpstreamHandshake(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Cancel from the upstream script: it runs after the CONNECT request has
+	// been read, so the dial is provably mid-handshake — no scheduling race.
+	fx := startDialFallbackFixtureScript(t, func(conn net.Conn) error {
+		cancel()
+		// Stall until the abandoned dial times out and closes the connection.
+		io.Copy(io.Discard, conn)
+		return nil
+	})
+	fx.p.connectTimeout = 500 * time.Millisecond
+
+	start := time.Now()
+	conn, viaUpstream, err := fx.p.dial(ctx, fx.target, nil)
+	if conn != nil {
+		conn.Close()
+		t.Fatal("expected nil conn on canceled dial")
+	}
+	if viaUpstream {
+		t.Fatal("unexpected viaUpstream=true")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got: %v", err)
+	}
+	// Returning well within connectTimeout (500ms) proves dial detached from
+	// the stalled handshake instead of waiting it out.
+	if elapsed := time.Since(start); elapsed >= 250*time.Millisecond {
+		t.Fatalf("dial did not return promptly after cancel: %v", elapsed)
+	}
+	if err := <-fx.serverErr; err != nil {
+		t.Fatalf("mock upstream failed: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !fx.p.backoff.shouldSkip(fx.p.upstream, time.Now()) {
+		if time.Now().After(deadline) {
+			t.Fatal("abandoned handshake's timeout did not mark the upstream for backoff")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case <-fx.accepted:
+		t.Fatal("direct fallback occurred despite cancellation")
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+// TestDialCanceledDuringAuthDoesNotMarkBackoff pins the fail-closed side of
+// abandoned-handshake settling: an auth-stage failure resolved after the
+// requester canceled must not mark backoff, mirroring the attended path.
+func TestDialCanceledDuringAuthDoesNotMarkBackoff(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	targetLn := mustListenLoopback(t, "target")
+	target := targetFromListener(t, targetLn)
+	accepted := make(chan struct{}, 1)
+	go func() {
+		conn, err := targetLn.Accept()
+		if err == nil {
+			conn.Close()
+			accepted <- struct{}{}
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Select user/pass, read the subnegotiation, then cancel and stall: the
+	// abandoned dial times out inside authUpstream, an errUpstreamAuth path.
+	handshake := func(conn net.Conn, target socks5Target) error {
+		greeting := make([]byte, socksGreetingHeaderLen+2)
+		if _, err := io.ReadFull(conn, greeting); err != nil {
+			return err
+		}
+		if _, err := conn.Write([]byte{socksVersion, socksMethodUserPass}); err != nil {
+			return err
+		}
+		if _, err := readUserPassAuth(conn); err != nil {
+			return err
+		}
+		cancel()
+		io.Copy(io.Discard, conn)
+		return nil
+	}
+	upstreamAddr, serverErr := startScriptedUpstreamHandshake(t, target, handshake, func(net.Conn) error { return nil })
+
+	p := newTestProxy(upstreamAddr)
+	p.connectTimeout = 200 * time.Millisecond
+	conn, viaUpstream, err := p.dial(ctx, target, &socks5Creds{username: "user", password: "pass"})
+	if conn != nil {
+		conn.Close()
+		t.Fatal("expected nil conn on canceled dial")
+	}
+	if viaUpstream {
+		t.Fatal("unexpected viaUpstream=true")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got: %v", err)
+	}
+	// serverErr resolving means the abandoned dial closed its conn; give the
+	// settle goroutine a beat, then check it did not touch the cache.
+	if err := <-serverErr; err != nil {
+		t.Fatalf("mock upstream failed: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if p.backoff.shouldSkip(p.upstream, time.Now()) {
+		t.Fatal("auth-stage failure of an abandoned dial must not mark backoff")
+	}
+	select {
+	case <-accepted:
+		t.Fatal("direct fallback occurred despite cancellation")
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+func TestDialPreCanceledContext(t *testing.T) {
+	// Dead upstream: if dial did not short-circuit on the pre-canceled ctx, it
+	// would launch a probe that hits connection-refused within milliseconds
+	// and whose settle goroutine marks backoff. Asserting the mark stays
+	// absent past that window proves no dial was attempted at all.
+	p := newTestProxy("127.0.0.1:1")
+	p.dialTimeout = 100 * time.Millisecond
+
+	target := socks5Target{
+		atyp: socksAtypIPv4,
+		ip:   netip.MustParseAddr("127.0.0.1"),
+		port: 1,
+		addr: "127.0.0.1:1",
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	conn, viaUpstream, err := p.dial(ctx, target, nil)
+	if conn != nil {
+		conn.Close()
+		t.Fatal("expected nil conn on canceled dial")
+	}
+	if viaUpstream {
+		t.Fatal("unexpected viaUpstream=true")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if p.backoff.shouldSkip(p.upstream, time.Now()) {
+		t.Fatal("pre-canceled dial must not attempt an upstream connection")
+	}
+}
+
+// TestDialCanceledDuringUpstreamSuccess covers the settle goroutine's success
+// branch: when a handshake succeeds just after the caller cancels, the settle
+// goroutine — not the gone caller — owns the conn and must close it and clear
+// any backoff mark.
+func TestDialCanceledDuringUpstreamSuccess(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Cancel after the CONNECT request is read but before the (successful)
+	// reply is sent, then sleep so dial's select provably takes the Done arm
+	// before the result can reach the channel.
+	fx := startDialFallbackFixtureScript(t, func(conn net.Conn) error {
+		cancel()
+		time.Sleep(50 * time.Millisecond)
+		reply := []byte{socksVersion, socksRepSucceeded, socksRSV, socksAtypIPv4, 0, 0, 0, 0, 0, 0}
+		if _, err := conn.Write(reply); err != nil {
+			return err
+		}
+		// The success path cleared the deadline, so this only returns once
+		// the settle goroutine closes the abandoned conn.
+		io.Copy(io.Discard, conn)
+		return nil
+	})
+
+	conn, viaUpstream, err := fx.p.dial(ctx, fx.target, nil)
+	if conn != nil {
+		conn.Close()
+		t.Fatal("expected nil conn: the settle goroutine owns a detached success")
+	}
+	if viaUpstream {
+		t.Fatal("unexpected viaUpstream=true")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got: %v", err)
+	}
+	select {
+	case err := <-fx.serverErr:
+		if err != nil {
+			t.Fatalf("mock upstream failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("abandoned successful dial's conn was not closed by settle")
+	}
+	if fx.p.backoff.shouldSkip(fx.p.upstream, time.Now()) {
+		t.Fatal("successful settle must leave backoff clear")
+	}
+}
+
+func TestDialDirectHonorsContext(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	targetLn := mustListenLoopback(t, "target")
+	target := targetFromListener(t, targetLn)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	conn, _, err := dialDirect(ctx, target)
+	if conn != nil {
+		conn.Close()
+		t.Fatal("expected nil conn on canceled direct dial")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got: %v", err)
+	}
+}
+
 func TestDialMarksUnavailableBackoff(t *testing.T) {
 	p := newTestProxy("127.0.0.1:1")
 	p.dialTimeout = 100 * time.Millisecond
@@ -258,7 +491,7 @@ func TestDialMarksUnavailableBackoff(t *testing.T) {
 		addr: "127.0.0.1:1",
 	}
 
-	_, _, _ = p.dial(target, nil)
+	_, _, _ = p.dial(context.Background(), target, nil)
 	if !p.backoff.shouldSkip(p.upstream, time.Now()) {
 		t.Fatal("expected upstream backoff cache to be marked unavailable")
 	}
