@@ -17,9 +17,12 @@ const (
 	socksVersion = 0x05
 	socksRSV     = 0x00
 
-	socksMethodNoAuth         = 0x00
-	socksMethodNoAcceptable   = 0xFF
-	socksMethodSelectionCount = 0x01
+	socksMethodNoAuth       = 0x00
+	socksMethodUserPass     = 0x02
+	socksMethodNoAcceptable = 0xFF
+
+	socksUserPassVersion = 0x01
+	socksUserPassSuccess = 0x00
 
 	socksCmdConnect = 0x01
 
@@ -45,6 +48,13 @@ const (
 
 var errAddressTypeNotSupported = errors.New("address type not supported")
 var errUnknownReplyAddressType = errors.New("unknown reply address type")
+
+// socks5Creds holds RFC 1929 credentials captured from the client,
+// forwarded verbatim to the upstream proxy. Never validated locally.
+type socks5Creds struct {
+	username string
+	password string
+}
 
 // socks5Target holds the parsed CONNECT request from the client.
 type socks5Target struct {
@@ -74,12 +84,30 @@ func (p *proxy) handle(client net.Conn) {
 	if _, err := io.ReadFull(client, methods); err != nil {
 		return
 	}
-	if !slices.Contains(methods, socksMethodNoAuth) {
+	// Prefer username/password over no-auth: a client only offers 0x02 when
+	// it has credentials, and picking 0x00 would drop them.
+	var creds *socks5Creds
+	switch {
+	case slices.Contains(methods, socksMethodUserPass):
+		if _, err := client.Write([]byte{socksVersion, socksMethodUserPass}); err != nil {
+			return
+		}
+		c, err := readUserPassAuth(client)
+		if err != nil {
+			return
+		}
+		// Pass-through: always ACK. The upstream is the real validator; its
+		// rejection surfaces later as a CONNECT general-failure reply.
+		if _, err := client.Write([]byte{socksUserPassVersion, socksUserPassSuccess}); err != nil {
+			return
+		}
+		creds = &c
+	case slices.Contains(methods, socksMethodNoAuth):
+		if _, err := client.Write([]byte{socksVersion, socksMethodNoAuth}); err != nil {
+			return
+		}
+	default:
 		client.Write([]byte{socksVersion, socksMethodNoAcceptable})
-		return
-	}
-
-	if _, err := client.Write([]byte{socksVersion, socksMethodNoAuth}); err != nil {
 		return
 	}
 
@@ -111,7 +139,7 @@ func (p *proxy) handle(client net.Conn) {
 	}
 
 	// --- Try upstream, fallback to direct ---
-	remote, viaUpstream, err := p.dial(target)
+	remote, viaUpstream, err := p.dial(target, creds)
 	if err != nil {
 		log.Printf("FAIL %s: %v", target.addr, err)
 		var upstreamErr upstreamConnectError
@@ -119,7 +147,7 @@ func (p *proxy) handle(client net.Conn) {
 			sendReply(client, upstreamErr.rep)
 			return
 		}
-		if errors.Is(err, errUpstreamProtocol) {
+		if errors.Is(err, errUpstreamProtocol) || errors.Is(err, errUpstreamAuth) {
 			sendReply(client, socksRepGeneralFailure)
 			return
 		}
@@ -135,6 +163,34 @@ func (p *proxy) handle(client net.Conn) {
 	}
 	sendReplyWithBind(client, socksRepSucceeded, remote.LocalAddr())
 	relay(client, remote)
+}
+
+// readUserPassAuth parses the RFC 1929 subnegotiation:
+// VER(0x01) ULEN UNAME[ULEN] PLEN PASSWD[PLEN].
+// Zero-length fields are accepted (the RFC says 1-255, but the shim is a
+// pass-through and leaves validation to the upstream).
+func readUserPassAuth(r io.Reader) (socks5Creds, error) {
+	var c socks5Creds
+
+	hdr := make([]byte, 2) // VER ULEN
+	if _, err := io.ReadFull(r, hdr); err != nil {
+		return c, err
+	}
+	if hdr[0] != socksUserPassVersion {
+		return c, fmt.Errorf("unsupported auth subnegotiation version: %d", hdr[0])
+	}
+	uname := make([]byte, int(hdr[1])+1) // UNAME plus the trailing PLEN byte
+	if _, err := io.ReadFull(r, uname); err != nil {
+		return c, err
+	}
+	c.username = string(uname[:hdr[1]])
+	plen := uname[hdr[1]]
+	passwd := make([]byte, plen)
+	if _, err := io.ReadFull(r, passwd); err != nil {
+		return c, err
+	}
+	c.password = string(passwd)
+	return c, nil
 }
 
 // readTarget parses the destination address from a SOCKS5 CONNECT request.
@@ -189,7 +245,7 @@ func readTarget(r io.Reader, atyp byte) (socks5Target, error) {
 // dialUpstream performs a full SOCKS5 handshake with the upstream proxy.
 // p.dialTimeout covers TCP connect + greeting; p.connectTimeout covers the
 // CONNECT request/reply (includes the upstream-side dial to the target).
-func (p *proxy) dialUpstream(target socks5Target) (net.Conn, error) {
+func (p *proxy) dialUpstream(target socks5Target, creds *socks5Creds) (net.Conn, error) {
 	helloTimeout := p.dialTimeout
 	if helloTimeout <= 0 {
 		helloTimeout = defaultUpstreamDialTimeout
@@ -212,15 +268,34 @@ func (p *proxy) dialUpstream(target socks5Target) (net.Conn, error) {
 		return nil, fmt.Errorf("%w: %v", errUpstreamUnavailable, err)
 	}
 
-	// Greeting
-	if _, err := conn.Write([]byte{socksVersion, socksMethodSelectionCount, socksMethodNoAuth}); err != nil {
+	// Greeting: offer username/password too when the client supplied
+	// credentials to pass through.
+	greeting := []byte{socksVersion, 0x01, socksMethodNoAuth}
+	if creds != nil {
+		greeting = []byte{socksVersion, 0x02, socksMethodNoAuth, socksMethodUserPass}
+	}
+	if _, err := conn.Write(greeting); err != nil {
 		return nil, fmt.Errorf("%w: %v", errUpstreamUnavailable, err)
 	}
 	resp := make([]byte, socksGreetingHeaderLen)
 	if _, err := io.ReadFull(conn, resp); err != nil {
 		return nil, fmt.Errorf("%w: %v", errUpstreamUnavailable, err)
 	}
-	if resp[0] != socksVersion || resp[1] != socksMethodNoAuth {
+	switch {
+	case resp[0] != socksVersion:
+		return nil, fmt.Errorf("%w: auth response %x %x", errUpstreamProtocol, resp[0], resp[1])
+	case resp[1] == socksMethodNoAuth:
+	case resp[1] == socksMethodUserPass && creds != nil:
+		// Credential verification may wait on a slow upstream auth backend
+		// (LDAP/RADIUS), so give it the connect budget rather than the short
+		// greeting one.
+		if err := conn.SetDeadline(time.Now().Add(connectTimeout)); err != nil {
+			return nil, fmt.Errorf("%w: %v", errUpstreamUnavailable, err)
+		}
+		if err := authUpstream(conn, creds); err != nil {
+			return nil, err
+		}
+	default:
 		return nil, fmt.Errorf("%w: auth response %x %x", errUpstreamProtocol, resp[0], resp[1])
 	}
 
@@ -254,6 +329,35 @@ func (p *proxy) dialUpstream(target socks5Target) (net.Conn, error) {
 	conn.SetDeadline(time.Time{})
 	ok = true
 	return conn, nil
+}
+
+// authUpstream performs the RFC 1929 subnegotiation with the upstream.
+// Failures here are auth failures, never unavailability: some servers reject
+// bad credentials by closing mid-subnegotiation instead of sending a STATUS
+// byte, and treating that as unavailability would bypass the rejection via a
+// credential-less direct fallback. This path is deliberately fail-closed.
+func authUpstream(conn net.Conn, creds *socks5Creds) error {
+	if _, err := conn.Write(buildUserPassRequest(creds)); err != nil {
+		return fmt.Errorf("%w: %v", errUpstreamAuth, err)
+	}
+	reply := make([]byte, 2) // VER STATUS
+	if _, err := io.ReadFull(conn, reply); err != nil {
+		return fmt.Errorf("%w: %v", errUpstreamAuth, err)
+	}
+	if reply[0] != socksUserPassVersion {
+		return fmt.Errorf("%w: auth reply version 0x%02x", errUpstreamProtocol, reply[0])
+	}
+	if reply[1] != socksUserPassSuccess {
+		return fmt.Errorf("%w: status=0x%02x", errUpstreamAuth, reply[1])
+	}
+	return nil
+}
+
+func buildUserPassRequest(c *socks5Creds) []byte {
+	buf := []byte{socksUserPassVersion, byte(len(c.username))}
+	buf = append(buf, c.username...)
+	buf = append(buf, byte(len(c.password)))
+	return append(buf, c.password...)
 }
 
 func buildConnectRequest(t socks5Target) []byte {

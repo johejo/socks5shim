@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -9,6 +10,83 @@ import (
 	"testing"
 	"time"
 )
+
+// TestDialDoesNotFallbackOnUpstreamAuthRejection guards the invariant that a
+// credential rejection is never bypassed via a credential-less direct
+// connection, including when the upstream rejects by closing the connection
+// mid-subnegotiation instead of sending a STATUS byte.
+func TestDialDoesNotFallbackOnUpstreamAuthRejection(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	tests := []struct {
+		name  string
+		reply func(conn net.Conn) error // response to the RFC 1929 subnegotiation
+	}{
+		{
+			name: "status byte rejection",
+			reply: func(conn net.Conn) error {
+				_, err := conn.Write([]byte{socksUserPassVersion, 0x01})
+				return err
+			},
+		},
+		{
+			name:  "close without status byte",
+			reply: func(conn net.Conn) error { return nil }, // returning closes the conn
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			targetLn := mustListenLoopback(t, "target")
+			target := targetFromListener(t, targetLn)
+			accepted := make(chan struct{}, 1)
+			go func() {
+				conn, err := targetLn.Accept()
+				if err == nil {
+					conn.Close()
+					accepted <- struct{}{}
+				}
+			}()
+
+			handshake := func(conn net.Conn, target socks5Target) error {
+				if readGreetingWithUserPass(conn) == nil {
+					return fmt.Errorf("unexpected upstream greeting")
+				}
+				if _, err := conn.Write([]byte{socksVersion, socksMethodUserPass}); err != nil {
+					return err
+				}
+				if _, err := readUserPassAuth(conn); err != nil {
+					return err
+				}
+				return tt.reply(conn)
+			}
+			upstreamAddr, serverErr := startScriptedUpstreamHandshake(t, target, handshake, func(net.Conn) error { return nil })
+
+			p := newTestProxy(upstreamAddr)
+			conn, viaUpstream, err := p.dial(target, &socks5Creds{username: "user", password: "wrong"})
+			if conn != nil {
+				conn.Close()
+				t.Fatal("expected nil conn on upstream auth rejection")
+			}
+			if viaUpstream {
+				t.Fatal("unexpected viaUpstream=true")
+			}
+			if !errors.Is(err, errUpstreamAuth) {
+				t.Fatalf("expected errUpstreamAuth, got: %v", err)
+			}
+			if p.backoff.shouldSkip(p.upstream, time.Now()) {
+				t.Fatal("backoff cache must not be marked on auth rejection")
+			}
+			if err := <-serverErr; err != nil {
+				t.Fatalf("mock upstream failed: %v", err)
+			}
+			select {
+			case <-accepted:
+				t.Fatal("direct fallback occurred despite auth rejection")
+			case <-time.After(150 * time.Millisecond):
+			}
+		})
+	}
+}
 
 func TestDialDoesNotFallbackOnUpstreamConnectFailure(t *testing.T) {
 	skipIfShortNetwork(t)
@@ -122,7 +200,7 @@ func startDialFallbackFixture(t *testing.T, connectReply []byte) dialFallbackFix
 func (fx dialFallbackFixture) assertDirectFallback(t *testing.T) {
 	t.Helper()
 
-	conn, viaUpstream, err := fx.p.dial(fx.target)
+	conn, viaUpstream, err := fx.p.dial(fx.target, nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -146,7 +224,7 @@ func (fx dialFallbackFixture) assertDirectFallback(t *testing.T) {
 func (fx dialFallbackFixture) assertNoFallback(t *testing.T, wantRep byte) {
 	t.Helper()
 
-	conn, viaUpstream, err := fx.p.dial(fx.target)
+	conn, viaUpstream, err := fx.p.dial(fx.target, nil)
 	if conn != nil {
 		conn.Close()
 		t.Fatalf("expected nil conn on upstream CONNECT failure")
@@ -180,7 +258,7 @@ func TestDialMarksUnavailableBackoff(t *testing.T) {
 		addr: "127.0.0.1:1",
 	}
 
-	_, _, _ = p.dial(target)
+	_, _, _ = p.dial(target, nil)
 	if !p.backoff.shouldSkip(p.upstream, time.Now()) {
 		t.Fatal("expected upstream backoff cache to be marked unavailable")
 	}

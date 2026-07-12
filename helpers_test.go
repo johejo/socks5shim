@@ -31,13 +31,46 @@ func performUpstreamNoAuthHandshake(conn net.Conn, target socks5Target) error {
 	if _, err := io.ReadFull(conn, greeting); err != nil {
 		return err
 	}
-	if !bytes.Equal(greeting, []byte{socksVersion, socksMethodSelectionCount, socksMethodNoAuth}) {
+	if !bytes.Equal(greeting, []byte{socksVersion, 0x01, socksMethodNoAuth}) {
 		return fmt.Errorf("unexpected upstream greeting: %x", greeting)
 	}
 	if _, err := conn.Write([]byte{socksVersion, socksMethodNoAuth}); err != nil {
 		return err
 	}
+	return expectConnectRequest(conn, target)
+}
 
+// performUpstreamUserPassHandshake returns a handshake that selects the
+// username/password method, verifies the RFC 1929 subnegotiation carries
+// wantUser/wantPass, and accepts it.
+func performUpstreamUserPassHandshake(wantUser, wantPass string) func(net.Conn, socks5Target) error {
+	return func(conn net.Conn, target socks5Target) error {
+		greeting := make([]byte, socksGreetingHeaderLen+2)
+		if _, err := io.ReadFull(conn, greeting); err != nil {
+			return err
+		}
+		if !bytes.Equal(greeting, []byte{socksVersion, 0x02, socksMethodNoAuth, socksMethodUserPass}) {
+			return fmt.Errorf("unexpected upstream greeting: %x", greeting)
+		}
+		if _, err := conn.Write([]byte{socksVersion, socksMethodUserPass}); err != nil {
+			return err
+		}
+
+		creds, err := readUserPassAuth(conn)
+		if err != nil {
+			return err
+		}
+		if creds.username != wantUser || creds.password != wantPass {
+			return fmt.Errorf("unexpected credentials: %q/%q", creds.username, creds.password)
+		}
+		if _, err := conn.Write([]byte{socksUserPassVersion, socksUserPassSuccess}); err != nil {
+			return err
+		}
+		return expectConnectRequest(conn, target)
+	}
+}
+
+func expectConnectRequest(conn net.Conn, target socks5Target) error {
 	expectedReq := buildConnectRequest(target)
 	req := make([]byte, len(expectedReq))
 	if _, err := io.ReadFull(conn, req); err != nil {
@@ -55,6 +88,13 @@ func performUpstreamNoAuthHandshake(conn net.Conn, target socks5Target) error {
 // result (or the earlier accept/handshake error).
 func startScriptedUpstream(t *testing.T, target socks5Target, script func(net.Conn) error) (addr string, serverErr chan error) {
 	t.Helper()
+	return startScriptedUpstreamHandshake(t, target, performUpstreamNoAuthHandshake, script)
+}
+
+// startScriptedUpstreamHandshake is startScriptedUpstream with a custom
+// greeting/auth handshake (e.g. performUpstreamUserPassHandshake).
+func startScriptedUpstreamHandshake(t *testing.T, target socks5Target, handshake func(net.Conn, socks5Target) error, script func(net.Conn) error) (addr string, serverErr chan error) {
+	t.Helper()
 	ln := mustListenLoopback(t, "upstream")
 	serverErr = make(chan error, 1)
 	go func() {
@@ -66,7 +106,7 @@ func startScriptedUpstream(t *testing.T, target socks5Target, script func(net.Co
 		defer conn.Close()
 		conn.SetDeadline(time.Now().Add(5 * time.Second))
 
-		if err := performUpstreamNoAuthHandshake(conn, target); err != nil {
+		if err := handshake(conn, target); err != nil {
 			serverErr <- err
 			return
 		}

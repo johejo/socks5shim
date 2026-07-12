@@ -12,12 +12,12 @@ import (
 	"time"
 )
 
-func TestHandleRejectsGreetingWithoutNoAuthMethod(t *testing.T) {
+func TestHandleRejectsGreetingWithoutAcceptableMethod(t *testing.T) {
 	tests := []struct {
 		name    string
 		methods []byte
 	}{
-		{name: "no-auth not offered", methods: []byte{0x02}},
+		{name: "unsupported method only", methods: []byte{0x01}}, // GSSAPI
 		{name: "zero methods", methods: nil},
 	}
 	for _, tt := range tests {
@@ -30,6 +30,110 @@ func TestHandleRejectsGreetingWithoutNoAuthMethod(t *testing.T) {
 				t.Fatalf("unexpected auth response: %x", resp)
 			}
 		})
+	}
+}
+
+func TestHandleSelectsUserPassMethod(t *testing.T) {
+	tests := []struct {
+		name    string
+		methods []byte
+	}{
+		{name: "user-pass only", methods: []byte{socksMethodUserPass}},
+		{name: "preferred over no-auth", methods: []byte{socksMethodNoAuth, socksMethodUserPass}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, _ := startHandleSession(t, newTestProxy("127.0.0.1:9"))
+			writeGreeting(t, client, tt.methods...)
+
+			resp := readN(t, client, 2)
+			if !bytes.Equal(resp, []byte{socksVersion, socksMethodUserPass}) {
+				t.Fatalf("unexpected auth response: %x", resp)
+			}
+		})
+	}
+}
+
+func TestHandleClosesOnBadUserPassVersion(t *testing.T) {
+	client, done := startHandleSession(t, newTestProxy("127.0.0.1:9"))
+	writeGreeting(t, client, socksMethodUserPass)
+	readN(t, client, 2)
+
+	// RFC 1929 subnegotiation must start with VER=0x01; the handler rejects
+	// after reading the two header bytes.
+	if _, err := client.Write([]byte{0x05, 0x00}); err != nil {
+		t.Fatalf("Write auth request: %v", err)
+	}
+	waitDone(t, done)
+}
+
+func TestHandleTimesOutOnStalledUserPassSubnegotiation(t *testing.T) {
+	p := newTestProxy("127.0.0.1:9")
+	p.clientReadTimeout = 50 * time.Millisecond
+	client, done := startHandleSession(t, p)
+	writeGreeting(t, client, socksMethodUserPass)
+	readN(t, client, 2)
+
+	// Announce an 8-byte username then stall; handler should exit on deadline.
+	if _, err := client.Write([]byte{socksUserPassVersion, 0x08}); err != nil {
+		t.Fatalf("Write partial auth request: %v", err)
+	}
+	waitDone(t, done)
+}
+
+func TestReadUserPassAuth(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload []byte
+		want    socks5Creds
+		wantErr bool
+	}{
+		{
+			name:    "basic",
+			payload: []byte{0x01, 0x04, 'u', 's', 'e', 'r', 0x02, 'p', 'w'},
+			want:    socks5Creds{username: "user", password: "pw"},
+		},
+		{
+			// RFC 1929 says 1-255, but the shim is lenient and forwards as-is.
+			name:    "empty fields",
+			payload: []byte{0x01, 0x00, 0x00},
+			want:    socks5Creds{},
+		},
+		{
+			// Boundary for the ULEN+1 read trick: 255-byte username.
+			name:    "max-length username",
+			payload: append(append([]byte{0x01, 0xFF}, bytes.Repeat([]byte{'x'}, 255)...), 0x01, 'p'),
+			want:    socks5Creds{username: strings.Repeat("x", 255), password: "p"},
+		},
+		{name: "bad version", payload: []byte{0x05, 0x00, 0x00}, wantErr: true},
+		{name: "truncated username", payload: []byte{0x01, 0x04, 'u'}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := readUserPassAuth(bytes.NewReader(tt.payload))
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got creds %q/%q", got.username, got.password)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("readUserPassAuth: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("unexpected creds: %q/%q", got.username, got.password)
+			}
+		})
+	}
+}
+
+func TestBuildUserPassRequest(t *testing.T) {
+	// Expected bytes are written out per RFC 1929 section 2, independent of
+	// the production decoder.
+	got := buildUserPassRequest(&socks5Creds{username: "user", password: "pw"})
+	want := []byte{0x01, 0x04, 'u', 's', 'e', 'r', 0x02, 'p', 'w'}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("unexpected request:\n got %x\nwant %x", got, want)
 	}
 }
 
@@ -209,7 +313,7 @@ func TestDialUpstreamRejectsInvalidReplyHeader(t *testing.T) {
 		return err
 	})
 
-	_, err := newTestProxy(upstreamAddr).dialUpstream(target)
+	_, err := newTestProxy(upstreamAddr).dialUpstream(target, nil)
 	if err == nil || !errors.Is(err, errUpstreamProtocol) || !strings.Contains(err.Error(), "reply header") {
 		t.Fatalf("expected upstream reply header error, got: %v", err)
 	}
@@ -232,7 +336,7 @@ func TestDialUpstreamAllowsConnectReplySlowerThanHelloTimeout(t *testing.T) {
 	p := newTestProxy(upstreamAddr)
 	p.dialTimeout = 200 * time.Millisecond
 	p.connectTimeout = 5 * time.Second
-	conn, err := p.dialUpstream(target)
+	conn, err := p.dialUpstream(target, nil)
 	if err != nil {
 		t.Fatalf("dialUpstream: %v", err)
 	}
@@ -259,7 +363,7 @@ func TestDialUpstreamDrainsDomainBoundAddr(t *testing.T) {
 		return err
 	})
 
-	conn, err := newTestProxy(upstreamAddr).dialUpstream(target)
+	conn, err := newTestProxy(upstreamAddr).dialUpstream(target, nil)
 	if err != nil {
 		t.Fatalf("dialUpstream: %v", err)
 	}
@@ -272,6 +376,175 @@ func TestDialUpstreamDrainsDomainBoundAddr(t *testing.T) {
 	if err := <-serverErr; err != nil {
 		t.Fatalf("mock upstream failed: %v", err)
 	}
+}
+
+func TestDialUpstreamSendsCredentials(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	target := testTarget443()
+	upstreamAddr, serverErr := startScriptedUpstreamHandshake(t, target,
+		performUpstreamUserPassHandshake("user", "pass"),
+		func(conn net.Conn) error {
+			_, err := conn.Write([]byte{socksVersion, socksRepSucceeded, socksRSV, socksAtypIPv4, 127, 0, 0, 1, 0x12, 0x34})
+			return err
+		})
+
+	conn, err := newTestProxy(upstreamAddr).dialUpstream(target, &socks5Creds{username: "user", password: "pass"})
+	if err != nil {
+		t.Fatalf("dialUpstream: %v", err)
+	}
+	conn.Close()
+	if err := <-serverErr; err != nil {
+		t.Fatalf("mock upstream failed: %v", err)
+	}
+}
+
+func TestDialUpstreamWithCredsUpstreamPicksNoAuth(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	target := testTarget443()
+	handshake := func(conn net.Conn, target socks5Target) error {
+		greeting := readGreetingWithUserPass(conn)
+		if greeting == nil {
+			return fmt.Errorf("unexpected upstream greeting")
+		}
+		// Upstream may pick no-auth even when credentials were offered; the
+		// subnegotiation must be skipped.
+		if _, err := conn.Write([]byte{socksVersion, socksMethodNoAuth}); err != nil {
+			return err
+		}
+		return expectConnectRequest(conn, target)
+	}
+	upstreamAddr, serverErr := startScriptedUpstreamHandshake(t, target, handshake, func(conn net.Conn) error {
+		_, err := conn.Write([]byte{socksVersion, socksRepSucceeded, socksRSV, socksAtypIPv4, 127, 0, 0, 1, 0x12, 0x34})
+		return err
+	})
+
+	conn, err := newTestProxy(upstreamAddr).dialUpstream(target, &socks5Creds{username: "user", password: "pass"})
+	if err != nil {
+		t.Fatalf("dialUpstream: %v", err)
+	}
+	conn.Close()
+	if err := <-serverErr; err != nil {
+		t.Fatalf("mock upstream failed: %v", err)
+	}
+}
+
+func TestDialUpstreamAuthRejected(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	target := testTarget443()
+	handshake := func(conn net.Conn, target socks5Target) error {
+		if readGreetingWithUserPass(conn) == nil {
+			return fmt.Errorf("unexpected upstream greeting")
+		}
+		if _, err := conn.Write([]byte{socksVersion, socksMethodUserPass}); err != nil {
+			return err
+		}
+		if _, err := readUserPassAuth(conn); err != nil {
+			return err
+		}
+		_, err := conn.Write([]byte{socksUserPassVersion, 0x01}) // reject
+		return err
+	}
+	upstreamAddr, serverErr := startScriptedUpstreamHandshake(t, target, handshake, func(net.Conn) error { return nil })
+
+	_, err := newTestProxy(upstreamAddr).dialUpstream(target, &socks5Creds{username: "user", password: "wrong"})
+	if !errors.Is(err, errUpstreamAuth) {
+		t.Fatalf("expected errUpstreamAuth, got: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("mock upstream failed: %v", err)
+	}
+}
+
+func TestDialUpstreamWithCredsMethodNoAcceptable(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	target := testTarget443()
+	handshake := func(conn net.Conn, target socks5Target) error {
+		if readGreetingWithUserPass(conn) == nil {
+			return fmt.Errorf("unexpected upstream greeting")
+		}
+		_, err := conn.Write([]byte{socksVersion, socksMethodNoAcceptable})
+		return err
+	}
+	upstreamAddr, serverErr := startScriptedUpstreamHandshake(t, target, handshake, func(net.Conn) error { return nil })
+
+	_, err := newTestProxy(upstreamAddr).dialUpstream(target, &socks5Creds{username: "user", password: "pass"})
+	if !errors.Is(err, errUpstreamProtocol) {
+		t.Fatalf("expected errUpstreamProtocol, got: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("mock upstream failed: %v", err)
+	}
+}
+
+func TestDialUpstreamNoCredsUpstreamPicksUserPass(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	target := testTarget443()
+	handshake := func(conn net.Conn, target socks5Target) error {
+		greeting := make([]byte, socksGreetingHeaderLen+1)
+		if _, err := io.ReadFull(conn, greeting); err != nil {
+			return err
+		}
+		// The shim offered only no-auth (creds==nil); selecting user/pass is a
+		// protocol violation it must refuse rather than attempt a nil-creds
+		// subnegotiation.
+		_, err := conn.Write([]byte{socksVersion, socksMethodUserPass})
+		return err
+	}
+	upstreamAddr, serverErr := startScriptedUpstreamHandshake(t, target, handshake, func(net.Conn) error { return nil })
+
+	_, err := newTestProxy(upstreamAddr).dialUpstream(target, nil)
+	if !errors.Is(err, errUpstreamProtocol) {
+		t.Fatalf("expected errUpstreamProtocol, got: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("mock upstream failed: %v", err)
+	}
+}
+
+func TestDialUpstreamBadAuthReplyVersion(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	target := testTarget443()
+	handshake := func(conn net.Conn, target socks5Target) error {
+		if readGreetingWithUserPass(conn) == nil {
+			return fmt.Errorf("unexpected upstream greeting")
+		}
+		if _, err := conn.Write([]byte{socksVersion, socksMethodUserPass}); err != nil {
+			return err
+		}
+		if _, err := readUserPassAuth(conn); err != nil {
+			return err
+		}
+		_, err := conn.Write([]byte{0x05, socksUserPassSuccess}) // wrong subneg version
+		return err
+	}
+	upstreamAddr, serverErr := startScriptedUpstreamHandshake(t, target, handshake, func(net.Conn) error { return nil })
+
+	_, err := newTestProxy(upstreamAddr).dialUpstream(target, &socks5Creds{username: "user", password: "pass"})
+	if !errors.Is(err, errUpstreamProtocol) {
+		t.Fatalf("expected errUpstreamProtocol, got: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("mock upstream failed: %v", err)
+	}
+}
+
+// readGreetingWithUserPass reads a 4-byte greeting and returns it if it is
+// exactly {05,02,00,02} (no-auth plus username/password offered), else nil.
+func readGreetingWithUserPass(conn net.Conn) []byte {
+	greeting := make([]byte, socksGreetingHeaderLen+2)
+	if _, err := io.ReadFull(conn, greeting); err != nil {
+		return nil
+	}
+	if !bytes.Equal(greeting, []byte{socksVersion, 0x02, socksMethodNoAuth, socksMethodUserPass}) {
+		return nil
+	}
+	return greeting
 }
 
 func TestHandleSuccessfulConnectAndRelayViaUpstream(t *testing.T) {
@@ -315,6 +588,115 @@ func TestHandleSuccessfulConnectAndRelayViaUpstream(t *testing.T) {
 
 	if err := <-serverErr; err != nil {
 		t.Fatalf("mock upstream failed: %v", err)
+	}
+}
+
+func TestHandlePassesCredentialsThroughToUpstream(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	tests := []struct {
+		name string
+		user string
+		pass string
+	}{
+		{name: "basic", user: "user", pass: "pass"},
+		{name: "empty credentials forwarded as-is", user: "", pass: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			target := testTarget443()
+			upstreamAddr, serverErr := startScriptedUpstreamHandshake(t, target,
+				performUpstreamUserPassHandshake(tt.user, tt.pass),
+				func(conn net.Conn) error {
+					reply := []byte{socksVersion, socksRepSucceeded, socksRSV, socksAtypIPv4, 127, 0, 0, 1, 0x12, 0x34}
+					if _, err := conn.Write(reply); err != nil {
+						return err
+					}
+
+					payload := make([]byte, 4)
+					if _, err := io.ReadFull(conn, payload); err != nil {
+						return err
+					}
+					if string(payload) != "ping" {
+						return fmt.Errorf("unexpected relay payload: %q", payload)
+					}
+					_, err := conn.Write([]byte("pong"))
+					return err
+				})
+
+			client, _ := startHandleSession(t, newTestProxy(upstreamAddr))
+			performClientUserPassHandshake(t, client, tt.user, tt.pass)
+
+			if _, err := client.Write(buildConnectRequest(target)); err != nil {
+				t.Fatalf("Write CONNECT request: %v", err)
+			}
+			reply := readN(t, client, 10)
+			if reply[0] != socksVersion || reply[1] != socksRepSucceeded {
+				t.Fatalf("unexpected CONNECT reply: %x", reply)
+			}
+
+			if _, err := client.Write([]byte("ping")); err != nil {
+				t.Fatalf("Write relay payload: %v", err)
+			}
+			if got := string(readN(t, client, 4)); got != "pong" {
+				t.Fatalf("unexpected relay response: %q", got)
+			}
+
+			if err := <-serverErr; err != nil {
+				t.Fatalf("mock upstream failed: %v", err)
+			}
+		})
+	}
+}
+
+func TestHandleReturnsGeneralFailureWhenUpstreamRejectsAuth(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	// A reachable target proves whether a (forbidden) direct fallback happened.
+	targetLn := mustListenLoopback(t, "target")
+	accepted := make(chan struct{}, 1)
+	go func() {
+		conn, err := targetLn.Accept()
+		if err == nil {
+			conn.Close()
+			accepted <- struct{}{}
+		}
+	}()
+	target := targetFromListener(t, targetLn)
+
+	handshake := func(conn net.Conn, target socks5Target) error {
+		if readGreetingWithUserPass(conn) == nil {
+			return fmt.Errorf("unexpected upstream greeting")
+		}
+		if _, err := conn.Write([]byte{socksVersion, socksMethodUserPass}); err != nil {
+			return err
+		}
+		if _, err := readUserPassAuth(conn); err != nil {
+			return err
+		}
+		_, err := conn.Write([]byte{socksUserPassVersion, 0x01}) // reject
+		return err
+	}
+	upstreamAddr, serverErr := startScriptedUpstreamHandshake(t, target, handshake, func(net.Conn) error { return nil })
+
+	client, _ := startHandleSession(t, newTestProxy(upstreamAddr))
+	performClientUserPassHandshake(t, client, "user", "wrong")
+
+	if _, err := client.Write(buildConnectRequest(target)); err != nil {
+		t.Fatalf("Write CONNECT request: %v", err)
+	}
+	reply := readN(t, client, 10)
+	if reply[1] != socksRepGeneralFailure {
+		t.Fatalf("unexpected rep code: 0x%02x", reply[1])
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("mock upstream failed: %v", err)
+	}
+
+	select {
+	case <-accepted:
+		t.Fatal("direct fallback occurred despite upstream auth rejection")
+	case <-time.After(150 * time.Millisecond):
 	}
 }
 
@@ -469,6 +851,22 @@ func performClientNoAuthHandshake(t *testing.T, client net.Conn) {
 	authResp := readN(t, client, 2)
 	if !bytes.Equal(authResp, []byte{socksVersion, socksMethodNoAuth}) {
 		t.Fatalf("unexpected auth response: %x", authResp)
+	}
+}
+
+func performClientUserPassHandshake(t *testing.T, client net.Conn, user, pass string) {
+	t.Helper()
+	writeGreeting(t, client, socksMethodNoAuth, socksMethodUserPass)
+	authResp := readN(t, client, 2)
+	if !bytes.Equal(authResp, []byte{socksVersion, socksMethodUserPass}) {
+		t.Fatalf("unexpected auth response: %x", authResp)
+	}
+	if _, err := client.Write(buildUserPassRequest(&socks5Creds{username: user, password: pass})); err != nil {
+		t.Fatalf("Write auth request: %v", err)
+	}
+	subResp := readN(t, client, 2)
+	if !bytes.Equal(subResp, []byte{socksUserPassVersion, socksUserPassSuccess}) {
+		t.Fatalf("unexpected auth status: %x", subResp)
 	}
 }
 

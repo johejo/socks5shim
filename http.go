@@ -71,7 +71,7 @@ func (p *proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	target := buildHTTPTarget(host, port)
-	remote, viaUpstream, err := p.dial(target)
+	remote, viaUpstream, err := p.dial(target, nil)
 	if err != nil {
 		log.Printf("HTTP CONNECT FAIL %s: %v", target.addr, err)
 		http.Error(w, "dial failed", http.StatusBadGateway)
@@ -113,7 +113,7 @@ func (p *proxy) dialContext(_ context.Context, _, addr string) (net.Conn, error)
 		return nil, err
 	}
 	target := buildHTTPTarget(host, port)
-	remote, viaUpstream, err := p.dial(target)
+	remote, viaUpstream, err := p.dial(target, nil)
 	if err != nil {
 		return nil, err
 	}

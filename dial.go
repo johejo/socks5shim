@@ -20,6 +20,7 @@ const (
 
 var errUpstreamUnavailable = errors.New("upstream unavailable")
 var errUpstreamProtocol = errors.New("upstream protocol error")
+var errUpstreamAuth = errors.New("upstream rejected credentials")
 
 // proxy holds the routing configuration and upstream backoff state shared by
 // the SOCKS5 and HTTP handlers.
@@ -128,12 +129,12 @@ func replyCodeFromDialError(err error) byte {
 }
 
 // dial tries the upstream SOCKS5 proxy first; on failure, connects directly.
-func (p *proxy) dial(target socks5Target) (net.Conn, bool, error) {
+func (p *proxy) dial(target socks5Target, creds *socks5Creds) (net.Conn, bool, error) {
 	if p.backoff.shouldSkip(p.upstream, time.Now()) {
 		return dialDirect(target)
 	}
 
-	conn, err := p.dialUpstream(target)
+	conn, err := p.dialUpstream(target, creds)
 	if err == nil {
 		p.backoff.clear(p.upstream)
 		return conn, true, nil
@@ -149,6 +150,8 @@ func (p *proxy) dial(target socks5Target) (net.Conn, bool, error) {
 		log.Printf("upstream CONNECT failed (rep=0x%02x) for %s; falling back to direct", connectErr.rep, target.addr)
 		return dialDirect(target)
 	}
+	// errUpstreamAuth and errUpstreamProtocol land here: deliberate
+	// rejections must not be bypassed via a direct fallback.
 	if !errors.Is(err, errUpstreamUnavailable) {
 		return nil, false, err
 	}
