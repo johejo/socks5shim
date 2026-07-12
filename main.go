@@ -55,7 +55,9 @@ const (
 	directDialTimeout             = 10 * time.Second
 	upstreamUnavailableBackoff    = 3 * time.Second
 
-	maxHTTPLineLength = 8 << 10
+	maxHTTPLineLength  = 8 << 10
+	maxHTTPHeaderBytes = 64 << 10
+	maxHTTPHeaderLines = 100
 )
 
 var errAddressTypeNotSupported = errors.New("address type not supported")
@@ -63,6 +65,20 @@ var errHTTPLineTooLong = errors.New("http line too long")
 var errUpstreamUnavailable = errors.New("upstream unavailable")
 var errUpstreamProtocol = errors.New("upstream protocol error")
 var errUnknownReplyAddressType = errors.New("unknown reply address type")
+
+// hopByHopHeaders is the RFC-defined hop-by-hop set (RFC 7230 §6.1 /
+// RFC 2616 §13.5.1) minus Transfer-Encoding: the body is relayed as raw
+// bytes, so its framing must reach the origin intact.
+var hopByHopHeaders = map[string]bool{
+	"connection":          true,
+	"proxy-connection":    true,
+	"keep-alive":          true,
+	"proxy-authorization": true,
+	"proxy-authenticate":  true,
+	"te":                  true,
+	"trailer":             true,
+	"upgrade":             true,
+}
 
 var upstreamBackoffCache = newUpstreamBackoffState(upstreamUnavailableBackoff)
 var version string
@@ -617,7 +633,9 @@ func respondLineTooLong(client net.Conn, proto string, err error) {
 }
 
 func handleHTTPConnect(client net.Conn, br *bufio.Reader, uri, proto, upstream string, dialTimeout, connectTimeout time.Duration) {
-	// Read and discard headers until empty line.
+	// Read and discard headers until empty line, still bounding the total
+	// so a client cannot stream junk until the read deadline.
+	var headerBytes, headerCount int
 	for {
 		line, err := readHTTPLine(br)
 		if err != nil {
@@ -626,6 +644,12 @@ func handleHTTPConnect(client net.Conn, br *bufio.Reader, uri, proto, upstream s
 		}
 		if strings.TrimRight(line, "\r\n") == "" {
 			break
+		}
+		headerBytes += len(line)
+		headerCount++
+		if headerBytes > maxHTTPHeaderBytes || headerCount > maxHTTPHeaderLines {
+			respondLineTooLong(client, proto, errHTTPLineTooLong)
+			return
 		}
 	}
 
@@ -701,26 +725,53 @@ func handleHTTPPlain(client net.Conn, br *bufio.Reader, method, uri, proto, upst
 		return
 	}
 
-	// Forward headers, removing hop-by-hop Proxy-* headers.
+	// Forward headers, removing hop-by-hop ones — both the well-known set
+	// and any nominated by Connection (RFC 7230 §6.1). A nomination may
+	// appear after the header it names, so buffer all headers first.
 	// Force Connection: close so neither side reuses the connection;
 	// relay() forwards raw bytes and cannot route a second request.
+	type headerLine struct {
+		raw  string
+		name string
+	}
+	var headerLines []headerLine
+	var headerBytes int
+	nominated := map[string]bool{}
 	for {
 		line, err := readHTTPLine(br)
 		if err != nil {
 			respondLineTooLong(client, proto, err)
 			return
 		}
-		trimmed := strings.TrimRight(line, "\r\n")
-		if trimmed == "" {
-			remote.Write([]byte("Connection: close\r\n\r\n"))
+		if strings.TrimRight(line, "\r\n") == "" {
 			break
 		}
-		lower := strings.ToLower(trimmed)
-		if strings.HasPrefix(lower, "proxy-connection:") || strings.HasPrefix(lower, "proxy-authorization:") || strings.HasPrefix(lower, "connection:") || strings.HasPrefix(lower, "keep-alive:") {
+		headerBytes += len(line)
+		if headerBytes > maxHTTPHeaderBytes || len(headerLines) >= maxHTTPHeaderLines {
+			respondLineTooLong(client, proto, errHTTPLineTooLong)
+			return
+		}
+		name, value, ok := splitHeaderLine(line)
+		if !ok {
+			client.Write([]byte(proto + " 400 Bad Request\r\n\r\n"))
+			return
+		}
+		headerLines = append(headerLines, headerLine{raw: line, name: name})
+		if name == "connection" || name == "proxy-connection" {
+			for tok := range strings.SplitSeq(value, ",") {
+				if tok = strings.ToLower(strings.TrimSpace(tok)); tok != "" {
+					nominated[tok] = true
+				}
+			}
+		}
+	}
+	for _, h := range headerLines {
+		if hopByHopHeaders[h.name] || nominated[h.name] {
 			continue
 		}
-		remote.Write([]byte(line))
+		remote.Write([]byte(h.raw))
 	}
+	remote.Write([]byte("Connection: close\r\n\r\n"))
 
 	if err := client.SetReadDeadline(time.Time{}); err != nil {
 		return
@@ -736,6 +787,19 @@ func handleHTTPPlain(client net.Conn, br *bufio.Reader, method, uri, proto, upst
 	}
 
 	relay(client, remote)
+}
+
+// splitHeaderLine splits a raw header line into its lowercased field name
+// and raw value. Lines with no colon, an empty name, or whitespace in the
+// name — which covers obs-fold continuations and space-before-colon — are
+// rejected (RFC 9112 §5.1, §5.2): forwarding them verbatim invites the
+// origin to parse the request differently than this proxy did.
+func splitHeaderLine(line string) (name, value string, ok bool) {
+	name, value, found := strings.Cut(strings.TrimRight(line, "\r\n"), ":")
+	if !found || name == "" || strings.ContainsAny(name, " \t") {
+		return "", "", false
+	}
+	return strings.ToLower(name), value, true
 }
 
 func parseHostPort(hostport, defaultPort string) (string, uint16, error) {
