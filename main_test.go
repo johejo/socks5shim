@@ -19,6 +19,12 @@ import (
 
 const testIOTimeout = 2 * time.Second
 
+// unreachableTargetAddr is a request target for tests where the handler
+// rejects the headers before dialing, so no listener is needed. If a
+// regression makes the handler dial first, the refused connection turns
+// into a 502 and the status assertion fails.
+const unreachableTargetAddr = "127.0.0.1:9"
+
 func TestResolveVersion(t *testing.T) {
 	origVersion := version
 	t.Cleanup(func() {
@@ -32,7 +38,7 @@ func TestResolveVersion(t *testing.T) {
 }
 
 func TestHandleRejectsWhenNoNoAuthMethod(t *testing.T) {
-	client, _ := startHandleSession(t, "127.0.0.1:9", 100*time.Millisecond, 100*time.Millisecond, false)
+	client, _ := startHandleSession(t, newTestProxy("127.0.0.1:9"))
 	writeGreeting(t, client, 0x02)
 
 	resp := readN(t, client, 2)
@@ -42,7 +48,7 @@ func TestHandleRejectsWhenNoNoAuthMethod(t *testing.T) {
 }
 
 func TestHandleRejectsZeroMethodsGreeting(t *testing.T) {
-	client, _ := startHandleSession(t, "127.0.0.1:9", 100*time.Millisecond, 100*time.Millisecond, false)
+	client, _ := startHandleSession(t, newTestProxy("127.0.0.1:9"))
 	writeGreeting(t, client)
 
 	resp := readN(t, client, 2)
@@ -52,7 +58,7 @@ func TestHandleRejectsZeroMethodsGreeting(t *testing.T) {
 }
 
 func TestHandleRejectsInvalidConnectHeader(t *testing.T) {
-	client, _ := startHandleSession(t, "127.0.0.1:9", 100*time.Millisecond, 100*time.Millisecond, false)
+	client, _ := startHandleSession(t, newTestProxy("127.0.0.1:9"))
 	performClientNoAuthHandshake(t, client)
 
 	// Bad VER in CONNECT header should be rejected before reading target bytes.
@@ -66,7 +72,7 @@ func TestHandleRejectsInvalidConnectHeader(t *testing.T) {
 }
 
 func TestHandleRejectsUnsupportedAddressType(t *testing.T) {
-	client, _ := startHandleSession(t, "127.0.0.1:9", 100*time.Millisecond, 100*time.Millisecond, false)
+	client, _ := startHandleSession(t, newTestProxy("127.0.0.1:9"))
 	performClientNoAuthHandshake(t, client)
 
 	// Unknown ATYP must be mapped to REP=0x08.
@@ -80,7 +86,9 @@ func TestHandleRejectsUnsupportedAddressType(t *testing.T) {
 }
 
 func TestHandleTimesOutOnStalledClient(t *testing.T) {
-	client, done := startHandleSession(t, "127.0.0.1:9", 100*time.Millisecond, 50*time.Millisecond, false)
+	p := newTestProxy("127.0.0.1:9")
+	p.clientReadTimeout = 50 * time.Millisecond
+	client, done := startHandleSession(t, p)
 
 	// Send only one byte of greeting then stall; handler should exit on deadline.
 	if _, err := client.Write([]byte{socksVersion}); err != nil {
@@ -218,38 +226,14 @@ func TestDrainBoundAddr(t *testing.T) {
 func TestDialUpstreamRejectsInvalidReplyHeader(t *testing.T) {
 	skipIfShortNetwork(t)
 
-	ln := mustListenLoopback(t, "upstream")
-
-	target := socks5Target{
-		atyp: socksAtypIPv4,
-		ip:   netip.MustParseAddr("1.2.3.4"),
-		port: 443,
-		addr: "1.2.3.4:443",
-	}
-
-	serverErr := make(chan error, 1)
-	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			serverErr <- err
-			return
-		}
-		defer conn.Close()
-
-		if err := performUpstreamNoAuthHandshake(conn, target); err != nil {
-			serverErr <- err
-			return
-		}
-
+	target := testTarget443()
+	upstreamAddr, serverErr := startScriptedUpstream(t, target, func(conn net.Conn) error {
 		// Invalid VER in upstream CONNECT reply header.
-		if _, err := conn.Write([]byte{0x04, socksRepSucceeded, socksRSV, socksAtypIPv4}); err != nil {
-			serverErr <- err
-			return
-		}
-		serverErr <- nil
-	}()
+		_, err := conn.Write([]byte{0x04, socksRepSucceeded, socksRSV, socksAtypIPv4})
+		return err
+	})
 
-	_, err := dialUpstream(ln.Addr().String(), target, 2*time.Second, 2*time.Second)
+	_, err := newTestProxy(upstreamAddr).dialUpstream(target)
 	if err == nil || !errors.Is(err, errUpstreamProtocol) || !strings.Contains(err.Error(), "reply header") {
 		t.Fatalf("expected upstream reply header error, got: %v", err)
 	}
@@ -273,8 +257,9 @@ func TestDialDoesNotFallbackOnUpstreamConnectFailure(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fx := startDialFallbackFixture(t, []byte{socksVersion, tt.rep, socksRSV, socksAtypIPv4})
-			fx.assertNoFallback(t, tt.fallbackGeneralFailure, tt.rep)
-			if upstreamBackoffCache.shouldSkip(fx.upstreamAddr, time.Now()) {
+			fx.p.fallbackGeneralFailure = tt.fallbackGeneralFailure
+			fx.assertNoFallback(t, tt.rep)
+			if fx.p.backoff.shouldSkip(fx.p.upstream, time.Now()) {
 				t.Fatal("backoff cache must not be marked on CONNECT rep failure")
 			}
 		})
@@ -299,8 +284,9 @@ func TestDialFallsBackOnUpstreamDialFailure(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Upstream-side dial failure.
 			fx := startDialFallbackFixture(t, []byte{socksVersion, tt.rep, socksRSV, socksAtypIPv4, 0, 0, 0, 0, 0, 0})
-			fx.assertDirectFallback(t, 200*time.Millisecond, 200*time.Millisecond, tt.fallbackGeneralFailure)
-			if upstreamBackoffCache.shouldSkip(fx.upstreamAddr, time.Now()) {
+			fx.p.fallbackGeneralFailure = tt.fallbackGeneralFailure
+			fx.assertDirectFallback(t)
+			if fx.p.backoff.shouldSkip(fx.p.upstream, time.Now()) {
 				t.Fatal("backoff cache must not be marked on CONNECT rep failure")
 			}
 		})
@@ -312,26 +298,27 @@ func TestDialFallsBackOnConnectReplyTimeout(t *testing.T) {
 
 	// Upstream completes the greeting, then never answers the CONNECT request.
 	fx := startDialFallbackFixture(t, nil)
-	fx.assertDirectFallback(t, time.Second, 200*time.Millisecond, false)
-	if !upstreamBackoffCache.shouldSkip(fx.upstreamAddr, time.Now()) {
+	fx.p.connectTimeout = 200 * time.Millisecond
+	fx.assertDirectFallback(t)
+	if !fx.p.backoff.shouldSkip(fx.p.upstream, time.Now()) {
 		t.Fatal("backoff cache must be marked on CONNECT reply timeout")
 	}
 }
 
 type dialFallbackFixture struct {
-	upstreamAddr string
-	target       socks5Target
-	accepted     chan struct{}
-	serverErr    chan error
+	p         *proxy
+	target    socks5Target
+	accepted  chan struct{}
+	serverErr chan error
 }
 
 // startDialFallbackFixture starts a target listener that signals when it is
 // dialed and a mock upstream that completes the greeting, then writes
-// connectReply. An empty connectReply makes the upstream stall until cleanup.
+// connectReply. An empty connectReply makes the upstream stall until the
+// dialer gives up and closes the connection.
 func startDialFallbackFixture(t *testing.T, connectReply []byte) dialFallbackFixture {
 	t.Helper()
 
-	upstreamLn := mustListenLoopback(t, "upstream")
 	targetLn := mustListenLoopback(t, "target")
 	target := targetFromListener(t, targetLn)
 
@@ -344,52 +331,30 @@ func startDialFallbackFixture(t *testing.T, connectReply []byte) dialFallbackFix
 		}
 	}()
 
-	upstreamAddr := upstreamLn.Addr().String()
-	upstreamBackoffCache.clear(upstreamAddr)
-	t.Cleanup(func() { upstreamBackoffCache.clear(upstreamAddr) })
-
-	var stall chan struct{}
-	if len(connectReply) == 0 {
-		stall = make(chan struct{})
-		t.Cleanup(func() { close(stall) })
-	}
-
-	serverErr := make(chan error, 1)
-	go func() {
-		conn, err := upstreamLn.Accept()
-		if err != nil {
-			serverErr <- err
-			return
-		}
-		defer conn.Close()
-
-		if err := performUpstreamNoAuthHandshake(conn, target); err != nil {
-			serverErr <- err
-			return
-		}
+	upstreamAddr, serverErr := startScriptedUpstream(t, target, func(conn net.Conn) error {
 		if len(connectReply) == 0 {
-			serverErr <- nil
-			<-stall
-			return
+			// Stall until the dialer times out and closes the connection.
+			io.Copy(io.Discard, conn)
+			return nil
 		}
-		_, err = conn.Write(connectReply)
-		serverErr <- err
-	}()
+		_, err := conn.Write(connectReply)
+		return err
+	})
 
 	return dialFallbackFixture{
-		upstreamAddr: upstreamAddr,
-		target:       target,
-		accepted:     accepted,
-		serverErr:    serverErr,
+		p:         newTestProxy(upstreamAddr),
+		target:    target,
+		accepted:  accepted,
+		serverErr: serverErr,
 	}
 }
 
 // assertDirectFallback runs dial and checks it fell back to a direct
 // connection to the target.
-func (fx dialFallbackFixture) assertDirectFallback(t *testing.T, helloTimeout, connectTimeout time.Duration, fallbackGeneralFailure bool) {
+func (fx dialFallbackFixture) assertDirectFallback(t *testing.T) {
 	t.Helper()
 
-	conn, viaUpstream, err := dial(fx.upstreamAddr, fx.target, helloTimeout, connectTimeout, fallbackGeneralFailure)
+	conn, viaUpstream, err := fx.p.dial(fx.target)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -410,10 +375,10 @@ func (fx dialFallbackFixture) assertDirectFallback(t *testing.T, helloTimeout, c
 
 // assertNoFallback runs dial and checks the upstream CONNECT failure was
 // propagated instead of bypassed via a direct connection.
-func (fx dialFallbackFixture) assertNoFallback(t *testing.T, fallbackGeneralFailure bool, wantRep byte) {
+func (fx dialFallbackFixture) assertNoFallback(t *testing.T, wantRep byte) {
 	t.Helper()
 
-	conn, viaUpstream, err := dial(fx.upstreamAddr, fx.target, 200*time.Millisecond, 200*time.Millisecond, fallbackGeneralFailure)
+	conn, viaUpstream, err := fx.p.dial(fx.target)
 	if conn != nil {
 		conn.Close()
 		t.Fatalf("expected nil conn on upstream CONNECT failure")
@@ -439,40 +404,18 @@ func (fx dialFallbackFixture) assertNoFallback(t *testing.T, fallbackGeneralFail
 func TestDialUpstreamAllowsConnectReplySlowerThanHelloTimeout(t *testing.T) {
 	skipIfShortNetwork(t)
 
-	upstreamLn := mustListenLoopback(t, "upstream")
-
-	target := socks5Target{
-		atyp: socksAtypIPv4,
-		ip:   netip.MustParseAddr("1.2.3.4"),
-		port: 443,
-		addr: "1.2.3.4:443",
-	}
-
-	serverErr := make(chan error, 1)
-	go func() {
-		conn, err := upstreamLn.Accept()
-		if err != nil {
-			serverErr <- err
-			return
-		}
-		defer conn.Close()
-
-		if err := performUpstreamNoAuthHandshake(conn, target); err != nil {
-			serverErr <- err
-			return
-		}
-
+	target := testTarget443()
+	upstreamAddr, serverErr := startScriptedUpstream(t, target, func(conn net.Conn) error {
 		// Reply well after helloTimeout but within connectTimeout.
 		time.Sleep(600 * time.Millisecond)
-		reply := []byte{socksVersion, socksRepSucceeded, socksRSV, socksAtypIPv4, 127, 0, 0, 1, 0x12, 0x34}
-		if _, err := conn.Write(reply); err != nil {
-			serverErr <- err
-			return
-		}
-		serverErr <- nil
-	}()
+		_, err := conn.Write([]byte{socksVersion, socksRepSucceeded, socksRSV, socksAtypIPv4, 127, 0, 0, 1, 0x12, 0x34})
+		return err
+	})
 
-	conn, err := dialUpstream(upstreamLn.Addr().String(), target, 200*time.Millisecond, 5*time.Second)
+	p := newTestProxy(upstreamAddr)
+	p.dialTimeout = 200 * time.Millisecond
+	p.connectTimeout = 5 * time.Second
+	conn, err := p.dialUpstream(target)
 	if err != nil {
 		t.Fatalf("dialUpstream: %v", err)
 	}
@@ -485,29 +428,8 @@ func TestDialUpstreamAllowsConnectReplySlowerThanHelloTimeout(t *testing.T) {
 func TestDialUpstreamDrainsDomainBoundAddr(t *testing.T) {
 	skipIfShortNetwork(t)
 
-	upstreamLn := mustListenLoopback(t, "upstream")
-
-	target := socks5Target{
-		atyp: socksAtypIPv4,
-		ip:   netip.MustParseAddr("1.2.3.4"),
-		port: 443,
-		addr: "1.2.3.4:443",
-	}
-
-	serverErr := make(chan error, 1)
-	go func() {
-		conn, err := upstreamLn.Accept()
-		if err != nil {
-			serverErr <- err
-			return
-		}
-		defer conn.Close()
-
-		if err := performUpstreamNoAuthHandshake(conn, target); err != nil {
-			serverErr <- err
-			return
-		}
-
+	target := testTarget443()
+	upstreamAddr, serverErr := startScriptedUpstream(t, target, func(conn net.Conn) error {
 		// Reply with a domain-typed BND.ADDR, immediately followed by relay
 		// data. If drainBoundAddr consumes the wrong byte count, the client
 		// reads garbage instead of "pong".
@@ -516,14 +438,11 @@ func TestDialUpstreamDrainsDomainBoundAddr(t *testing.T) {
 		reply = append(reply, domain...)
 		reply = append(reply, 0x04, 0x38) // 1080
 		reply = append(reply, "pong"...)
-		if _, err := conn.Write(reply); err != nil {
-			serverErr <- err
-			return
-		}
-		serverErr <- nil
-	}()
+		_, err := conn.Write(reply)
+		return err
+	})
 
-	conn, err := dialUpstream(upstreamLn.Addr().String(), target, 2*time.Second, 2*time.Second)
+	conn, err := newTestProxy(upstreamAddr).dialUpstream(target)
 	if err != nil {
 		t.Fatalf("dialUpstream: %v", err)
 	}
@@ -541,53 +460,25 @@ func TestDialUpstreamDrainsDomainBoundAddr(t *testing.T) {
 func TestHandleSuccessfulConnectAndRelayViaUpstream(t *testing.T) {
 	skipIfShortNetwork(t)
 
-	upstreamLn := mustListenLoopback(t, "upstream")
-
-	target := socks5Target{
-		atyp: socksAtypIPv4,
-		ip:   netip.MustParseAddr("1.2.3.4"),
-		port: 443,
-		addr: "1.2.3.4:443",
-	}
-
-	serverErr := make(chan error, 1)
-	go func() {
-		conn, err := upstreamLn.Accept()
-		if err != nil {
-			serverErr <- err
-			return
-		}
-		defer conn.Close()
-
-		setDeadline(t, conn, testIOTimeout)
-		if err := performUpstreamNoAuthHandshake(conn, target); err != nil {
-			serverErr <- err
-			return
-		}
-
+	target := testTarget443()
+	upstreamAddr, serverErr := startScriptedUpstream(t, target, func(conn net.Conn) error {
 		reply := []byte{socksVersion, socksRepSucceeded, socksRSV, socksAtypIPv4, 127, 0, 0, 1, 0x12, 0x34}
 		if _, err := conn.Write(reply); err != nil {
-			serverErr <- err
-			return
+			return err
 		}
 
 		payload := make([]byte, 4)
 		if _, err := io.ReadFull(conn, payload); err != nil {
-			serverErr <- err
-			return
+			return err
 		}
 		if string(payload) != "ping" {
-			serverErr <- fmt.Errorf("unexpected relay payload: %q", payload)
-			return
+			return fmt.Errorf("unexpected relay payload: %q", payload)
 		}
-		if _, err := conn.Write([]byte("pong")); err != nil {
-			serverErr <- err
-			return
-		}
-		serverErr <- nil
-	}()
+		_, err := conn.Write([]byte("pong"))
+		return err
+	})
 
-	client, _ := startHandleSession(t, upstreamLn.Addr().String(), 200*time.Millisecond, 200*time.Millisecond, false)
+	client, _ := startHandleSession(t, newTestProxy(upstreamAddr))
 	performClientNoAuthHandshake(t, client)
 
 	if _, err := client.Write(buildConnectRequest(target)); err != nil {
@@ -641,30 +532,15 @@ func TestHandleFallsBackToDirectOnUpstreamConnectFailure(t *testing.T) {
 			}()
 			target := targetFromListener(t, targetLn)
 
-			upstreamLn := mustListenLoopback(t, "upstream")
-			upstreamAddr := upstreamLn.Addr().String()
-			upstreamBackoffCache.clear(upstreamAddr)
-			t.Cleanup(func() { upstreamBackoffCache.clear(upstreamAddr) })
-
-			serverErr := make(chan error, 1)
-			go func() {
-				conn, err := upstreamLn.Accept()
-				if err != nil {
-					serverErr <- err
-					return
-				}
-				defer conn.Close()
-
-				if err := performUpstreamNoAuthHandshake(conn, target); err != nil {
-					serverErr <- err
-					return
-				}
+			upstreamAddr, serverErr := startScriptedUpstream(t, target, func(conn net.Conn) error {
 				// Fallback-eligible failure: handle() must retry direct.
-				_, err = conn.Write([]byte{socksVersion, tt.rep, socksRSV, socksAtypIPv4, 0, 0, 0, 0, 0, 0})
-				serverErr <- err
-			}()
+				_, err := conn.Write([]byte{socksVersion, tt.rep, socksRSV, socksAtypIPv4, 0, 0, 0, 0, 0, 0})
+				return err
+			})
 
-			client, _ := startHandleSession(t, upstreamAddr, 200*time.Millisecond, 200*time.Millisecond, tt.fallbackGeneralFailure)
+			p := newTestProxy(upstreamAddr)
+			p.fallbackGeneralFailure = tt.fallbackGeneralFailure
+			client, _ := startHandleSession(t, p)
 			performClientNoAuthHandshake(t, client)
 
 			if _, err := client.Write(buildConnectRequest(target)); err != nil {
@@ -712,26 +588,12 @@ func TestHandleReturnsUpstreamRepToClient(t *testing.T) {
 			}()
 			target := targetFromListener(t, targetLn)
 
-			upstreamLn := mustListenLoopback(t, "upstream")
+			upstreamAddr, serverErr := startScriptedUpstream(t, target, func(conn net.Conn) error {
+				_, err := conn.Write([]byte{socksVersion, tt.rep, socksRSV, socksAtypIPv4, 0, 0, 0, 0, 0, 0})
+				return err
+			})
 
-			serverErr := make(chan error, 1)
-			go func() {
-				conn, err := upstreamLn.Accept()
-				if err != nil {
-					serverErr <- err
-					return
-				}
-				defer conn.Close()
-
-				if err := performUpstreamNoAuthHandshake(conn, target); err != nil {
-					serverErr <- err
-					return
-				}
-				_, err = conn.Write([]byte{socksVersion, tt.rep, socksRSV, socksAtypIPv4, 0, 0, 0, 0, 0, 0})
-				serverErr <- err
-			}()
-
-			client, _ := startHandleSession(t, upstreamLn.Addr().String(), 200*time.Millisecond, 200*time.Millisecond, false)
+			client, _ := startHandleSession(t, newTestProxy(upstreamAddr))
 			performClientNoAuthHandshake(t, client)
 
 			if _, err := client.Write(buildConnectRequest(target)); err != nil {
@@ -755,9 +617,8 @@ func TestHandleReturnsUpstreamRepToClient(t *testing.T) {
 }
 
 func TestDialMarksUnavailableBackoff(t *testing.T) {
-	upstreamAddr := "127.0.0.1:1"
-	upstreamBackoffCache.clear(upstreamAddr)
-	t.Cleanup(func() { upstreamBackoffCache.clear(upstreamAddr) })
+	p := newTestProxy("127.0.0.1:1")
+	p.dialTimeout = 100 * time.Millisecond
 
 	target := socks5Target{
 		atyp: socksAtypIPv4,
@@ -766,8 +627,8 @@ func TestDialMarksUnavailableBackoff(t *testing.T) {
 		addr: "127.0.0.1:1",
 	}
 
-	_, _, _ = dial(upstreamAddr, target, 100*time.Millisecond, 100*time.Millisecond, false)
-	if !upstreamBackoffCache.shouldSkip(upstreamAddr, time.Now()) {
+	_, _, _ = p.dial(target)
+	if !p.backoff.shouldSkip(p.upstream, time.Now()) {
 		t.Fatal("expected upstream backoff cache to be marked unavailable")
 	}
 }
@@ -823,12 +684,43 @@ func TestSendReplyWithBindUsesActualIPv6Bind(t *testing.T) {
 	}
 }
 
-func startHandleSession(t *testing.T, upstream string, dialTimeout, clientReadTimeout time.Duration, fallbackGeneralFailure bool) (net.Conn, chan struct{}) {
+// newTestProxy returns a proxy with a fresh backoff cache and generous
+// timeouts; tests exercising timeout expiry override individual fields.
+func newTestProxy(upstream string) *proxy {
+	return &proxy{
+		upstream:          upstream,
+		dialTimeout:       testIOTimeout,
+		connectTimeout:    testIOTimeout,
+		clientReadTimeout: testIOTimeout,
+		backoff:           newUpstreamBackoffState(upstreamUnavailableBackoff),
+	}
+}
+
+// startHandleSession runs p.handle on one end of a pipe and returns the
+// other end plus a channel closed when the handler exits.
+func startHandleSession(t *testing.T, p *proxy) (net.Conn, chan struct{}) {
 	t.Helper()
 	client, server := testClientServer(t)
 	done := make(chan struct{})
 	go func() {
-		handle(server, upstream, dialTimeout, dialTimeout, clientReadTimeout, fallbackGeneralFailure)
+		p.handle(server)
+		close(done)
+	}()
+	setDeadline(t, client, testIOTimeout)
+	t.Cleanup(func() {
+		client.Close()
+		waitDone(t, done)
+	})
+	return client, done
+}
+
+// startHandleHTTPSession is startHandleSession for the HTTP handler.
+func startHandleHTTPSession(t *testing.T, p *proxy) (net.Conn, chan struct{}) {
+	t.Helper()
+	client, server := testClientServer(t)
+	done := make(chan struct{})
+	go func() {
+		p.handleHTTP(server)
 		close(done)
 	}()
 	setDeadline(t, client, testIOTimeout)
@@ -877,6 +769,43 @@ func performUpstreamNoAuthHandshake(conn net.Conn, target socks5Target) error {
 		return fmt.Errorf("unexpected CONNECT request: %x", req)
 	}
 	return nil
+}
+
+// startScriptedUpstream starts a mock SOCKS5 upstream that accepts one
+// connection, verifies the greeting and CONNECT request for target, then
+// runs script on the connection. The returned channel receives the script's
+// result (or the earlier accept/handshake error).
+func startScriptedUpstream(t *testing.T, target socks5Target, script func(net.Conn) error) (addr string, serverErr chan error) {
+	t.Helper()
+	ln := mustListenLoopback(t, "upstream")
+	serverErr = make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+		if err := performUpstreamNoAuthHandshake(conn, target); err != nil {
+			serverErr <- err
+			return
+		}
+		serverErr <- script(conn)
+	}()
+	return ln.Addr().String(), serverErr
+}
+
+// testTarget443 is an arbitrary fixed CONNECT target for tests whose mock
+// upstream never actually dials it.
+func testTarget443() socks5Target {
+	return socks5Target{
+		atyp: socksAtypIPv4,
+		ip:   netip.MustParseAddr("1.2.3.4"),
+		port: 443,
+		addr: "1.2.3.4:443",
+	}
 }
 
 func readN(t *testing.T, r io.Reader, n int) []byte {
@@ -954,22 +883,13 @@ func setDeadline(t *testing.T, conn net.Conn, timeout time.Duration) {
 func TestHandleHTTPConnect(t *testing.T) {
 	skipIfShortNetwork(t)
 
-	// Start a target TCP server that echoes data.
-	targetLn := mustListenLoopback(t, "target")
-	go func() {
-		conn, err := targetLn.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		io.Copy(conn, conn)
-	}()
+	targetAddr := startEchoTarget(t)
 
 	// Connect to the HTTP proxy and send a CONNECT request.
-	proxyAddr := startHTTPProxyStack(t, targetLn.Addr().String())
+	proxyAddr := startHTTPProxyStack(t, targetAddr)
 	conn := dialHTTPProxy(t, proxyAddr)
 
-	fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", targetLn.Addr().String(), targetLn.Addr().String())
+	fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", targetAddr, targetAddr)
 
 	br := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(br, nil)
@@ -993,36 +913,17 @@ func TestHandleHTTPConnect(t *testing.T) {
 func TestHandleHTTPPlainGET(t *testing.T) {
 	skipIfShortNetwork(t)
 
-	// Start a target HTTP server.
-	targetLn := mustListenLoopback(t, "target")
-	go func() {
-		for {
-			conn, err := targetLn.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				br := bufio.NewReader(c)
-				req, err := http.ReadRequest(br)
-				if err != nil {
-					return
-				}
-				if req.URL.Path != "/test" {
-					fmt.Fprintf(c, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
-					return
-				}
-				body := "OK"
-				fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
-			}(conn)
+	targetAddr := startHeaderEchoTarget(t, func(req *http.Request) string {
+		if req.URL.Path != "/test" {
+			return "unexpected path: " + req.URL.Path
 		}
-	}()
+		return "OK"
+	})
 
 	// Send a plain HTTP GET through the proxy.
 	proxyAddr := startHTTPProxyStack(t, "")
 	conn := dialHTTPProxy(t, proxyAddr)
 
-	targetAddr := targetLn.Addr().String()
 	fmt.Fprintf(conn, "GET http://%s/test HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", targetAddr, targetAddr)
 
 	br := bufio.NewReader(conn)
@@ -1132,23 +1033,12 @@ func TestHandleHTTPPlainForwardsTransferEncoding(t *testing.T) {
 func TestHandleHTTPPlainRejectsOversizedHeaders(t *testing.T) {
 	skipIfShortNetwork(t)
 
-	// Target that accepts and idles: the proxy dials before reading headers.
-	targetLn := mustListenLoopback(t, "target")
-	go func() {
-		conn, err := targetLn.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		io.Copy(io.Discard, conn)
-	}()
-
 	proxyAddr := startHTTPProxyStack(t, "")
 	conn := dialHTTPProxy(t, proxyAddr)
 
 	// Write concurrently: it blocks once the handler's buffer fills,
 	// leaving this goroutine free to read the 431.
-	targetAddr := targetLn.Addr().String()
+	targetAddr := unreachableTargetAddr
 	var payload bytes.Buffer
 	fmt.Fprintf(&payload, "GET http://%s/ HTTP/1.1\r\nHost: %s\r\n", targetAddr, targetAddr)
 	pad := strings.Repeat("a", 4<<10)
@@ -1162,13 +1052,8 @@ func TestHandleHTTPPlainRejectsOversizedHeaders(t *testing.T) {
 		conn.Write(payload.Bytes())
 	}()
 
-	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
-	if err != nil {
-		t.Fatalf("read response: %v", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != 431 {
-		t.Fatalf("unexpected status: %d", resp.StatusCode)
+	if status := readProxyStatus(t, conn); status != 431 {
+		t.Fatalf("unexpected status: %d", status)
 	}
 	<-wrote
 }
@@ -1196,23 +1081,6 @@ func TestSplitHeaderLine(t *testing.T) {
 	}
 }
 
-// startIdleTarget starts a TCP server that accepts one connection and
-// discards everything: the plain handler dials before reading headers,
-// so header-rejection tests need a reachable target.
-func startIdleTarget(t *testing.T) string {
-	t.Helper()
-	targetLn := mustListenLoopback(t, "target")
-	go func() {
-		conn, err := targetLn.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		io.Copy(io.Discard, conn)
-	}()
-	return targetLn.Addr().String()
-}
-
 func TestHandleHTTPPlainRejectsMalformedHeaders(t *testing.T) {
 	skipIfShortNetwork(t)
 
@@ -1226,7 +1094,7 @@ func TestHandleHTTPPlainRejectsMalformedHeaders(t *testing.T) {
 		{"empty name", ": v\r\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			targetAddr := startIdleTarget(t)
+			targetAddr := unreachableTargetAddr
 			proxyAddr := startHTTPProxyStack(t, "")
 			conn := dialHTTPProxy(t, proxyAddr)
 
@@ -1234,13 +1102,8 @@ func TestHandleHTTPPlainRejectsMalformedHeaders(t *testing.T) {
 			// header, and unread bytes would risk a RST eating the reply.
 			fmt.Fprintf(conn, "GET http://%s/ HTTP/1.1\r\nHost: %s\r\n%s", targetAddr, targetAddr, tc.header)
 
-			resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
-			if err != nil {
-				t.Fatalf("read response: %v", err)
-			}
-			resp.Body.Close()
-			if resp.StatusCode != 400 {
-				t.Fatalf("unexpected status: %d", resp.StatusCode)
+			if status := readProxyStatus(t, conn); status != 400 {
+				t.Fatalf("unexpected status: %d", status)
 			}
 		})
 	}
@@ -1249,7 +1112,7 @@ func TestHandleHTTPPlainRejectsMalformedHeaders(t *testing.T) {
 func TestHandleHTTPPlainRejectsTooManyHeaderLines(t *testing.T) {
 	skipIfShortNetwork(t)
 
-	targetAddr := startIdleTarget(t)
+	targetAddr := unreachableTargetAddr
 	proxyAddr := startHTTPProxyStack(t, "")
 	conn := dialHTTPProxy(t, proxyAddr)
 
@@ -1264,24 +1127,13 @@ func TestHandleHTTPPlainRejectsTooManyHeaderLines(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
-	if err != nil {
-		t.Fatalf("read response: %v", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != 431 {
-		t.Fatalf("unexpected status: %d", resp.StatusCode)
+	if status := readProxyStatus(t, conn); status != 431 {
+		t.Fatalf("unexpected status: %d", status)
 	}
 }
 
 func TestHandleHTTPConnectRejectsTooManyHeaderLines(t *testing.T) {
-	client, server := testClientServer(t)
-	done := make(chan struct{})
-	go func() {
-		handleHTTP(server, "127.0.0.1:9", 100*time.Millisecond, 100*time.Millisecond, 100*time.Millisecond, false)
-		close(done)
-	}()
-	setDeadline(t, client, testIOTimeout)
+	client, done := startHandleHTTPSession(t, newTestProxy("127.0.0.1:9"))
 
 	var payload bytes.Buffer
 	payload.WriteString("CONNECT example.com:443 HTTP/1.1\r\n")
@@ -1292,13 +1144,8 @@ func TestHandleHTTPConnectRejectsTooManyHeaderLines(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	resp, err := http.ReadResponse(bufio.NewReader(client), nil)
-	if err != nil {
-		t.Fatalf("read response: %v", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != 431 {
-		t.Fatalf("unexpected status: %d", resp.StatusCode)
+	if status := readProxyStatus(t, client); status != 431 {
+		t.Fatalf("unexpected status: %d", status)
 	}
 	waitDone(t, done)
 }
@@ -1306,47 +1153,23 @@ func TestHandleHTTPConnectRejectsTooManyHeaderLines(t *testing.T) {
 func TestHandleHTTPPlainForcesConnectionClose(t *testing.T) {
 	skipIfShortNetwork(t)
 
-	// Target server that honors keep-alive: it keeps serving requests on
-	// the same connection unless the request asked for Connection: close.
-	targetLn := mustListenLoopback(t, "target")
 	connHeader := make(chan string, 1)
 	keepAliveHeader := make(chan string, 1)
-	go func() {
-		for {
-			conn, err := targetLn.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				br := bufio.NewReader(c)
-				for {
-					req, err := http.ReadRequest(br)
-					if err != nil {
-						return
-					}
-					select {
-					case connHeader <- req.Header.Get("Connection"):
-					default:
-					}
-					select {
-					case keepAliveHeader <- req.Header.Get("Keep-Alive"):
-					default:
-					}
-					body := "OK"
-					fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
-					if req.Close {
-						return
-					}
-				}
-			}(conn)
+	targetAddr := startKeepAliveTarget(t, func(req *http.Request) string {
+		select {
+		case connHeader <- req.Header.Get("Connection"):
+		default:
 		}
-	}()
+		select {
+		case keepAliveHeader <- req.Header.Get("Keep-Alive"):
+		default:
+		}
+		return "OK"
+	})
 
 	proxyAddr := startHTTPProxyStack(t, "")
 	conn := dialHTTPProxy(t, proxyAddr)
 
-	targetAddr := targetLn.Addr().String()
 	fmt.Fprintf(conn, "GET http://%s/ HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5, max=100\r\n\r\n", targetAddr, targetAddr)
 
 	br := bufio.NewReader(conn)
@@ -1378,34 +1201,8 @@ func TestHandleHTTPPlainSecondRequestNotMisrouted(t *testing.T) {
 	skipIfShortNetwork(t)
 
 	// Two targets that honor keep-alive, each identified by its response body.
-	startTarget := func(marker string) string {
-		ln := mustListenLoopback(t, "target-"+marker)
-		go func() {
-			for {
-				conn, err := ln.Accept()
-				if err != nil {
-					return
-				}
-				go func(c net.Conn) {
-					defer c.Close()
-					br := bufio.NewReader(c)
-					for {
-						req, err := http.ReadRequest(br)
-						if err != nil {
-							return
-						}
-						fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s", len(marker), marker)
-						if req.Close {
-							return
-						}
-					}
-				}(conn)
-			}
-		}()
-		return ln.Addr().String()
-	}
-	targetA := startTarget("target-a")
-	targetB := startTarget("target-b")
+	targetA := startKeepAliveTarget(t, func(*http.Request) string { return "target-a" })
+	targetB := startKeepAliveTarget(t, func(*http.Request) string { return "target-b" })
 
 	proxyAddr := startHTTPProxyStack(t, "")
 	conn := dialHTTPProxy(t, proxyAddr)
@@ -1453,13 +1250,7 @@ func TestHandleHTTPPlainSecondRequestNotMisrouted(t *testing.T) {
 }
 
 func TestHandleHTTPRejectsInvalidProto(t *testing.T) {
-	client, server := testClientServer(t)
-	done := make(chan struct{})
-	go func() {
-		handleHTTP(server, "127.0.0.1:9", 100*time.Millisecond, 100*time.Millisecond, 100*time.Millisecond, false)
-		close(done)
-	}()
-	setDeadline(t, client, testIOTimeout)
+	client, done := startHandleHTTPSession(t, newTestProxy("127.0.0.1:9"))
 
 	// Send a request with a bogus protocol version.
 	fmt.Fprintf(client, "GET / HTTP/2.0\r\nHost: example.com\r\n\r\n")
@@ -1477,24 +1268,12 @@ func TestHandleHTTPRejectsInvalidHostLength(t *testing.T) {
 		{"oversized host", strings.Repeat("a", 256) + ":443"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			client, server := testClientServer(t)
-			done := make(chan struct{})
-			go func() {
-				handleHTTP(server, "127.0.0.1:9", 100*time.Millisecond, 100*time.Millisecond, 100*time.Millisecond, false)
-				close(done)
-			}()
-			setDeadline(t, client, testIOTimeout)
+			client, done := startHandleHTTPSession(t, newTestProxy("127.0.0.1:9"))
 
 			fmt.Fprintf(client, "CONNECT %s HTTP/1.1\r\nHost: example.com\r\n\r\n", tc.uri)
 
-			br := bufio.NewReader(client)
-			resp, err := http.ReadResponse(br, nil)
-			if err != nil {
-				t.Fatalf("read response: %v", err)
-			}
-			resp.Body.Close()
-			if resp.StatusCode != 400 {
-				t.Fatalf("unexpected status: %d", resp.StatusCode)
+			if status := readProxyStatus(t, client); status != 400 {
+				t.Fatalf("unexpected status: %d", status)
 			}
 			waitDone(t, done)
 		})
@@ -1511,24 +1290,12 @@ func TestHandleHTTPPlainRejectsNonHTTPScheme(t *testing.T) {
 		{"empty scheme", "//example.com/"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			client, server := testClientServer(t)
-			done := make(chan struct{})
-			go func() {
-				handleHTTP(server, "127.0.0.1:9", 100*time.Millisecond, 100*time.Millisecond, 100*time.Millisecond, false)
-				close(done)
-			}()
-			setDeadline(t, client, testIOTimeout)
+			client, done := startHandleHTTPSession(t, newTestProxy("127.0.0.1:9"))
 
 			fmt.Fprintf(client, "GET %s HTTP/1.1\r\nHost: example.com\r\n\r\n", tc.uri)
 
-			br := bufio.NewReader(client)
-			resp, err := http.ReadResponse(br, nil)
-			if err != nil {
-				t.Fatalf("read response: %v", err)
-			}
-			resp.Body.Close()
-			if resp.StatusCode != 400 {
-				t.Fatalf("unexpected status: %d", resp.StatusCode)
+			if status := readProxyStatus(t, client); status != 400 {
+				t.Fatalf("unexpected status: %d", status)
 			}
 			waitDone(t, done)
 		})
@@ -1544,13 +1311,7 @@ func TestHandleHTTPRejectsOversizedLine(t *testing.T) {
 		{"connect header", "CONNECT example.com:443 HTTP/1.1\r\nX-Pad: "},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			client, server := testClientServer(t)
-			done := make(chan struct{})
-			go func() {
-				handleHTTP(server, "127.0.0.1:9", 100*time.Millisecond, 100*time.Millisecond, 100*time.Millisecond, false)
-				close(done)
-			}()
-			setDeadline(t, client, testIOTimeout)
+			client, done := startHandleHTTPSession(t, newTestProxy("127.0.0.1:9"))
 
 			// Write concurrently: it blocks once the handler's buffer fills,
 			// leaving this goroutine free to read the 431.
@@ -1561,14 +1322,8 @@ func TestHandleHTTPRejectsOversizedLine(t *testing.T) {
 				client.Write(payload)
 			}()
 
-			br := bufio.NewReader(client)
-			resp, err := http.ReadResponse(br, nil)
-			if err != nil {
-				t.Fatalf("read response: %v", err)
-			}
-			resp.Body.Close()
-			if resp.StatusCode != 431 {
-				t.Fatalf("unexpected status: %d", resp.StatusCode)
+			if status := readProxyStatus(t, client); status != 431 {
+				t.Fatalf("unexpected status: %d", status)
 			}
 			waitDone(t, done)
 			<-wrote
@@ -1579,17 +1334,7 @@ func TestHandleHTTPRejectsOversizedLine(t *testing.T) {
 func TestHandleHTTPConnectFallsBackToDirect(t *testing.T) {
 	skipIfShortNetwork(t)
 
-	// Target TCP server that echoes data.
-	targetLn := mustListenLoopback(t, "target")
-	go func() {
-		conn, err := targetLn.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		io.Copy(conn, conn)
-	}()
-	targetAddr := targetLn.Addr().String()
+	targetAddr := startEchoTarget(t)
 
 	client := dialHTTPProxyWithDeadUpstream(t)
 
@@ -1616,22 +1361,7 @@ func TestHandleHTTPConnectFallsBackToDirect(t *testing.T) {
 func TestHandleHTTPPlainFallsBackToDirect(t *testing.T) {
 	skipIfShortNetwork(t)
 
-	// Target HTTP server.
-	targetLn := mustListenLoopback(t, "target")
-	go func() {
-		conn, err := targetLn.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		br := bufio.NewReader(conn)
-		if _, err := http.ReadRequest(br); err != nil {
-			return
-		}
-		body := "OK"
-		fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
-	}()
-	targetAddr := targetLn.Addr().String()
+	targetAddr := startHeaderEchoTarget(t, func(*http.Request) string { return "OK" })
 
 	client := dialHTTPProxyWithDeadUpstream(t)
 
@@ -1656,34 +1386,66 @@ func TestHandleHTTPPlainFallsBackToDirect(t *testing.T) {
 }
 
 // dialHTTPProxyWithDeadUpstream starts handleHTTP with an upstream address
-// that refuses connections, forcing the direct fallback path. The dead
-// upstream marks the backoff cache, so it is cleared on both sides.
+// that refuses connections, forcing the direct fallback path.
 func dialHTTPProxyWithDeadUpstream(t *testing.T) net.Conn {
 	t.Helper()
 
 	deadLn := mustListenLoopback(t, "dead-upstream")
 	deadAddr := deadLn.Addr().String()
 	deadLn.Close()
-	upstreamBackoffCache.clear(deadAddr)
-	t.Cleanup(func() { upstreamBackoffCache.clear(deadAddr) })
 
-	client, server := testClientServer(t)
-	done := make(chan struct{})
-	go func() {
-		handleHTTP(server, deadAddr, testIOTimeout, testIOTimeout, testIOTimeout, false)
-		close(done)
-	}()
-	t.Cleanup(func() {
-		client.Close()
-		waitDone(t, done)
-	})
-	setDeadline(t, client, testIOTimeout)
+	client, _ := startHandleHTTPSession(t, newTestProxy(deadAddr))
 	return client
 }
 
-// startHTTPProxyStack starts a mock upstream SOCKS5 proxy and an HTTP proxy
-// listener in front of it, returning the HTTP proxy address. fixedTarget is
-// passed through to serveMockUpstream.
+// startEchoTarget starts a TCP server that accepts one connection and
+// echoes everything back, and returns its address.
+func startEchoTarget(t *testing.T) string {
+	t.Helper()
+	ln := mustListenLoopback(t, "target")
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		io.Copy(conn, conn)
+	}()
+	return ln.Addr().String()
+}
+
+// startKeepAliveTarget starts an HTTP target that serves requests on the
+// same connection until one asks for Connection: close, answering each with
+// the body built by respond, and returns its address.
+func startKeepAliveTarget(t *testing.T, respond func(*http.Request) string) string {
+	t.Helper()
+	ln := mustListenLoopback(t, "target")
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				for {
+					req, err := http.ReadRequest(br)
+					if err != nil {
+						return
+					}
+					body := respond(req)
+					fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+					if req.Close {
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+	return ln.Addr().String()
+}
+
 // startHeaderEchoTarget starts an HTTP target that answers each request
 // with a body built by describe, and returns its address.
 func startHeaderEchoTarget(t *testing.T, describe func(*http.Request) string) string {
@@ -1724,6 +1486,20 @@ func readProxyResponseBody(t *testing.T, conn net.Conn) string {
 	return string(body)
 }
 
+// readProxyStatus reads one HTTP response from conn and returns its status code.
+func readProxyStatus(t *testing.T, conn net.Conn) int {
+	t.Helper()
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	resp.Body.Close()
+	return resp.StatusCode
+}
+
+// startHTTPProxyStack starts a mock upstream SOCKS5 proxy and an HTTP proxy
+// listener in front of it, returning the HTTP proxy address. fixedTarget is
+// passed through to serveMockUpstream.
 func startHTTPProxyStack(t *testing.T, fixedTarget string) string {
 	t.Helper()
 
@@ -1738,6 +1514,7 @@ func startHTTPProxyStack(t *testing.T, fixedTarget string) string {
 		}
 	}()
 
+	p := newTestProxy(upstreamLn.Addr().String())
 	httpLn := mustListenLoopback(t, "http-proxy")
 	go func() {
 		for {
@@ -1745,7 +1522,7 @@ func startHTTPProxyStack(t *testing.T, fixedTarget string) string {
 			if err != nil {
 				return
 			}
-			go handleHTTP(conn, upstreamLn.Addr().String(), testIOTimeout, testIOTimeout, testIOTimeout, false)
+			go p.handleHTTP(conn)
 		}
 	}()
 	return httpLn.Addr().String()
@@ -1805,15 +1582,7 @@ func serveMockUpstream(conn net.Conn, fixedTarget string) {
 	conn.Write([]byte{socksVersion, socksRepSucceeded, socksRSV, socksAtypIPv4, 127, 0, 0, 1, 0, 0})
 	conn.SetDeadline(time.Time{})
 
-	done := make(chan struct{})
-	go func() {
-		io.Copy(remote, conn)
-		closeWrite(remote)
-		close(done)
-	}()
-	io.Copy(conn, remote)
-	closeWrite(conn)
-	<-done
+	relay(conn, remote)
 }
 
 type acceptResult struct {

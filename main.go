@@ -62,6 +62,7 @@ const (
 
 var errAddressTypeNotSupported = errors.New("address type not supported")
 var errHTTPLineTooLong = errors.New("http line too long")
+var errMalformedHeader = errors.New("malformed header line")
 var errUpstreamUnavailable = errors.New("upstream unavailable")
 var errUpstreamProtocol = errors.New("upstream protocol error")
 var errUnknownReplyAddressType = errors.New("unknown reply address type")
@@ -80,8 +81,25 @@ var hopByHopHeaders = map[string]bool{
 	"upgrade":             true,
 }
 
-var upstreamBackoffCache = newUpstreamBackoffState(upstreamUnavailableBackoff)
 var version string
+
+// proxy holds the routing configuration and upstream backoff state shared by
+// the SOCKS5 and HTTP handlers.
+type proxy struct {
+	upstream               string
+	dialTimeout            time.Duration // TCP connect + SOCKS5 greeting to upstream
+	connectTimeout         time.Duration // SOCKS5 CONNECT reply from upstream
+	clientReadTimeout      time.Duration // client greeting/request reads
+	fallbackGeneralFailure bool
+	backoff                *upstreamBackoffState
+}
+
+func (p *proxy) readTimeout() time.Duration {
+	if p.clientReadTimeout <= 0 {
+		return defaultClientReadTimeout
+	}
+	return p.clientReadTimeout
+}
 
 type upstreamConnectError struct {
 	rep byte
@@ -161,15 +179,22 @@ func main() {
 		return
 	}
 
+	p := &proxy{
+		upstream:               *upstream,
+		dialTimeout:            *dialTimeout,
+		connectTimeout:         *connectTimeout,
+		clientReadTimeout:      *clientReadTimeout,
+		fallbackGeneralFailure: *fallbackGeneralFailure,
+		backoff:                newUpstreamBackoffState(upstreamUnavailableBackoff),
+	}
+
 	if *httpListen != "" {
 		httpLn, err := net.Listen("tcp", *httpListen)
 		if err != nil {
 			log.Fatal(err)
 		}
 		log.Printf("HTTP proxy listening on %s, upstream %s (dial-timeout %s, connect-timeout %s)", *httpListen, *upstream, *dialTimeout, *connectTimeout)
-		go acceptLoop(httpLn, "http", func(conn net.Conn) {
-			handleHTTP(conn, *upstream, *dialTimeout, *connectTimeout, *clientReadTimeout, *fallbackGeneralFailure)
-		})
+		go acceptLoop(httpLn, "http", p.handleHTTP)
 	}
 
 	ln, err := net.Listen("tcp", *listen)
@@ -178,9 +203,7 @@ func main() {
 	}
 	log.Printf("SOCKS5 listening on %s, upstream %s (dial-timeout %s, connect-timeout %s)", *listen, *upstream, *dialTimeout, *connectTimeout)
 
-	acceptLoop(ln, "socks5", func(conn net.Conn) {
-		handle(conn, *upstream, *dialTimeout, *connectTimeout, *clientReadTimeout, *fallbackGeneralFailure)
-	})
+	acceptLoop(ln, "socks5", p.handle)
 }
 
 // acceptLoop retries Accept errors with backoff so a persistent failure such
@@ -230,12 +253,9 @@ type socks5Target struct {
 	addr   string // host:port for dialing
 }
 
-func handle(client net.Conn, upstream string, dialTimeout, connectTimeout, clientReadTimeout time.Duration, fallbackGeneralFailure bool) {
+func (p *proxy) handle(client net.Conn) {
 	defer client.Close()
-	if clientReadTimeout <= 0 {
-		clientReadTimeout = defaultClientReadTimeout
-	}
-	if err := client.SetReadDeadline(time.Now().Add(clientReadTimeout)); err != nil {
+	if err := client.SetReadDeadline(time.Now().Add(p.readTimeout())); err != nil {
 		return
 	}
 
@@ -291,7 +311,7 @@ func handle(client net.Conn, upstream string, dialTimeout, connectTimeout, clien
 	}
 
 	// --- Try upstream, fallback to direct ---
-	remote, viaUpstream, err := dial(upstream, target, dialTimeout, connectTimeout, fallbackGeneralFailure)
+	remote, viaUpstream, err := p.dial(target)
 	if err != nil {
 		log.Printf("FAIL %s: %v", target.addr, err)
 		var upstreamErr upstreamConnectError
@@ -392,24 +412,24 @@ func replyCodeFromDialError(err error) byte {
 }
 
 // dial tries the upstream SOCKS5 proxy first; on failure, connects directly.
-func dial(upstream string, target socks5Target, helloTimeout, connectTimeout time.Duration, fallbackGeneralFailure bool) (net.Conn, bool, error) {
-	if upstreamBackoffCache.shouldSkip(upstream, time.Now()) {
+func (p *proxy) dial(target socks5Target) (net.Conn, bool, error) {
+	if p.backoff.shouldSkip(p.upstream, time.Now()) {
 		return dialDirect(target)
 	}
 
-	conn, err := dialUpstream(upstream, target, helloTimeout, connectTimeout)
+	conn, err := p.dialUpstream(target)
 	if err == nil {
-		upstreamBackoffCache.clear(upstream)
+		p.backoff.clear(p.upstream)
 		return conn, true, nil
 	}
 	var connectErr upstreamConnectError
 	if errors.As(err, &connectErr) {
-		if !connectErr.fallbackEligible(fallbackGeneralFailure) {
+		if !connectErr.fallbackEligible(p.fallbackGeneralFailure) {
 			return nil, false, err
 		}
 		// The greeting succeeded, so the upstream is alive: fall back
 		// without poisoning the backoff cache.
-		upstreamBackoffCache.clear(upstream)
+		p.backoff.clear(p.upstream)
 		log.Printf("upstream CONNECT failed (rep=0x%02x) for %s; falling back to direct", connectErr.rep, target.addr)
 		return dialDirect(target)
 	}
@@ -419,7 +439,7 @@ func dial(upstream string, target socks5Target, helloTimeout, connectTimeout tim
 
 	// Covers CONNECT reply timeouts too: back off so a wedged upstream
 	// doesn't stall every connection for connectTimeout.
-	upstreamBackoffCache.markUnavailable(upstream, time.Now())
+	p.backoff.markUnavailable(p.upstream, time.Now())
 	log.Printf("upstream unavailable: %v; falling back to direct", err)
 	return dialDirect(target)
 }
@@ -433,16 +453,18 @@ func dialDirect(target socks5Target) (net.Conn, bool, error) {
 }
 
 // dialUpstream performs a full SOCKS5 handshake with the upstream proxy.
-// helloTimeout covers TCP connect + greeting; connectTimeout covers the
+// p.dialTimeout covers TCP connect + greeting; p.connectTimeout covers the
 // CONNECT request/reply (includes the upstream-side dial to the target).
-func dialUpstream(addr string, target socks5Target, helloTimeout, connectTimeout time.Duration) (net.Conn, error) {
+func (p *proxy) dialUpstream(target socks5Target) (net.Conn, error) {
+	helloTimeout := p.dialTimeout
 	if helloTimeout <= 0 {
 		helloTimeout = defaultUpstreamDialTimeout
 	}
+	connectTimeout := p.connectTimeout
 	if connectTimeout <= 0 {
 		connectTimeout = defaultUpstreamConnectTimeout
 	}
-	conn, err := net.DialTimeout("tcp", addr, helloTimeout)
+	conn, err := net.DialTimeout("tcp", p.upstream, helloTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errUpstreamUnavailable, err)
 	}
@@ -501,7 +523,6 @@ func dialUpstream(addr string, target socks5Target, helloTimeout, connectTimeout
 	ok = true
 	return conn, nil
 }
-
 
 func buildConnectRequest(t socks5Target) []byte {
 	buf := []byte{socksVersion, socksCmdConnect, socksRSV, t.atyp}
@@ -581,12 +602,9 @@ func sendReplyWithBind(w io.Writer, rep byte, bind net.Addr) {
 	w.Write([]byte{socksVersion, rep, socksRSV, socksAtypIPv4, 0, 0, 0, 0, 0, 0})
 }
 
-func handleHTTP(client net.Conn, upstream string, dialTimeout, connectTimeout, clientReadTimeout time.Duration, fallbackGeneralFailure bool) {
+func (p *proxy) handleHTTP(client net.Conn) {
 	defer client.Close()
-	if clientReadTimeout <= 0 {
-		clientReadTimeout = defaultClientReadTimeout
-	}
-	if err := client.SetReadDeadline(time.Now().Add(clientReadTimeout)); err != nil {
+	if err := client.SetReadDeadline(time.Now().Add(p.readTimeout())); err != nil {
 		return
 	}
 
@@ -610,9 +628,9 @@ func handleHTTP(client net.Conn, upstream string, dialTimeout, connectTimeout, c
 	}
 
 	if strings.ToUpper(method) == "CONNECT" {
-		handleHTTPConnect(client, br, uri, proto, upstream, dialTimeout, connectTimeout, fallbackGeneralFailure)
+		p.handleHTTPConnect(client, br, uri, proto)
 	} else {
-		handleHTTPPlain(client, br, method, uri, proto, upstream, dialTimeout, connectTimeout, fallbackGeneralFailure)
+		p.handleHTTPPlain(client, br, method, uri, proto)
 	}
 }
 
@@ -632,42 +650,73 @@ func readHTTPLine(br *bufio.Reader) (string, error) {
 // respondLineTooLong writes a best-effort 431 if err is errHTTPLineTooLong.
 func respondLineTooLong(client net.Conn, proto string, err error) {
 	if errors.Is(err, errHTTPLineTooLong) {
-		client.Write([]byte(proto + " 431 Request Header Fields Too Large\r\n\r\n"))
+		httpRespond(client, proto, "431 Request Header Fields Too Large")
 	}
 }
 
-func handleHTTPConnect(client net.Conn, br *bufio.Reader, uri, proto, upstream string, dialTimeout, connectTimeout time.Duration, fallbackGeneralFailure bool) {
-	// Read and discard headers until empty line, still bounding the total
-	// so a client cannot stream junk until the read deadline.
-	var headerBytes, headerCount int
+// httpRespond writes a best-effort minimal status-line-only response.
+func httpRespond(w io.Writer, proto, status string) {
+	fmt.Fprintf(w, "%s %s\r\n\r\n", proto, status)
+}
+
+// forEachHeaderLine reads header lines up to the blank terminator, bounding
+// total size and line count so a client cannot stream junk until the read
+// deadline. fn (if non-nil) runs on each line as it arrives, so callers can
+// reject a bad header without waiting for the rest of the section.
+func forEachHeaderLine(br *bufio.Reader, fn func(line string) error) error {
+	var totalBytes, count int
 	for {
 		line, err := readHTTPLine(br)
 		if err != nil {
-			respondLineTooLong(client, proto, err)
-			return
+			return err
 		}
 		if strings.TrimRight(line, "\r\n") == "" {
-			break
+			return nil
 		}
-		headerBytes += len(line)
-		headerCount++
-		if headerBytes > maxHTTPHeaderBytes || headerCount > maxHTTPHeaderLines {
-			respondLineTooLong(client, proto, errHTTPLineTooLong)
+		totalBytes += len(line)
+		count++
+		if totalBytes > maxHTTPHeaderBytes || count > maxHTTPHeaderLines {
+			return errHTTPLineTooLong
+		}
+		if fn != nil {
+			if err := fn(line); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// relayBuffered flushes any bytes already buffered by br to remote, then
+// relays the two connections.
+func relayBuffered(client, remote net.Conn, br *bufio.Reader) {
+	if n := br.Buffered(); n > 0 {
+		buffered, _ := br.Peek(n)
+		if _, err := remote.Write(buffered); err != nil {
 			return
 		}
+		br.Discard(n)
+	}
+	relay(client, remote)
+}
+
+func (p *proxy) handleHTTPConnect(client net.Conn, br *bufio.Reader, uri, proto string) {
+	// Headers are read only to find the end of the request.
+	if err := forEachHeaderLine(br, nil); err != nil {
+		respondLineTooLong(client, proto, err)
+		return
 	}
 
 	host, port, err := parseHostPort(uri, "443")
 	if err != nil {
-		client.Write([]byte(proto + " 400 Bad Request\r\n\r\n"))
+		httpRespond(client, proto, "400 Bad Request")
 		return
 	}
 
 	target := buildHTTPTarget(host, port)
-	remote, viaUpstream, err := dial(upstream, target, dialTimeout, connectTimeout, fallbackGeneralFailure)
+	remote, viaUpstream, err := p.dial(target)
 	if err != nil {
 		log.Printf("HTTP CONNECT FAIL %s: %v", target.addr, err)
-		client.Write([]byte(proto + " 502 Bad Gateway\r\n\r\n"))
+		httpRespond(client, proto, "502 Bad Gateway")
 		return
 	}
 	defer remote.Close()
@@ -681,38 +730,63 @@ func handleHTTPConnect(client net.Conn, br *bufio.Reader, uri, proto, upstream s
 	if err := client.SetReadDeadline(time.Time{}); err != nil {
 		return
 	}
-	client.Write([]byte(proto + " 200 Connection established\r\n\r\n"))
+	httpRespond(client, proto, "200 Connection established")
 
-	// Flush any data already buffered by bufio.Reader before relaying.
-	if n := br.Buffered(); n > 0 {
-		buffered, _ := br.Peek(n)
-		if _, err := remote.Write(buffered); err != nil {
-			return
-		}
-		br.Discard(n)
-	}
-
-	relay(client, remote)
+	relayBuffered(client, remote, br)
 }
 
-func handleHTTPPlain(client net.Conn, br *bufio.Reader, method, uri, proto, upstream string, dialTimeout, connectTimeout time.Duration, fallbackGeneralFailure bool) {
+func (p *proxy) handleHTTPPlain(client net.Conn, br *bufio.Reader, method, uri, proto string) {
 	u, err := url.Parse(uri)
 	if err != nil || u.Scheme != "http" || u.Host == "" {
-		client.Write([]byte(proto + " 400 Bad Request\r\n\r\n"))
+		httpRespond(client, proto, "400 Bad Request")
 		return
 	}
 
 	host, port, err := parseHostPort(u.Host, "80")
 	if err != nil {
-		client.Write([]byte(proto + " 400 Bad Request\r\n\r\n"))
+		httpRespond(client, proto, "400 Bad Request")
+		return
+	}
+
+	// Collect headers so hop-by-hop ones can be dropped — both the
+	// well-known set and any nominated by Connection (RFC 7230 §6.1). A
+	// nomination may appear after the header it names, which is why
+	// forwarding waits until the whole section is read.
+	type headerLine struct {
+		raw  string
+		name string
+	}
+	var headerLines []headerLine
+	nominated := map[string]bool{}
+	err = forEachHeaderLine(br, func(line string) error {
+		name, value, ok := splitHeaderLine(line)
+		if !ok {
+			return errMalformedHeader
+		}
+		headerLines = append(headerLines, headerLine{raw: line, name: name})
+		if name == "connection" || name == "proxy-connection" {
+			for tok := range strings.SplitSeq(value, ",") {
+				if tok = strings.ToLower(strings.TrimSpace(tok)); tok != "" {
+					nominated[tok] = true
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, errMalformedHeader) {
+			httpRespond(client, proto, "400 Bad Request")
+		} else {
+			respondLineTooLong(client, proto, err)
+		}
 		return
 	}
 
 	target := buildHTTPTarget(host, port)
-	remote, viaUpstream, err := dial(upstream, target, dialTimeout, connectTimeout, fallbackGeneralFailure)
+	remote, viaUpstream, err := p.dial(target)
 	if err != nil {
 		log.Printf("HTTP PLAIN FAIL %s: %v", target.addr, err)
-		client.Write([]byte(proto + " 502 Bad Gateway\r\n\r\n"))
+		httpRespond(client, proto, "502 Bad Gateway")
 		return
 	}
 	defer remote.Close()
@@ -723,74 +797,27 @@ func handleHTTPPlain(client net.Conn, br *bufio.Reader, method, uri, proto, upst
 		log.Printf("HTTP PLAIN DIRECT %s -> %s", target.addr, remote.RemoteAddr())
 	}
 
-	// Rewrite request line to relative path.
-	path := u.RequestURI()
-	if _, err := fmt.Fprintf(remote, "%s %s %s\r\n", method, path, proto); err != nil {
-		return
-	}
-
-	// Forward headers, removing hop-by-hop ones — both the well-known set
-	// and any nominated by Connection (RFC 7230 §6.1). A nomination may
-	// appear after the header it names, so buffer all headers first.
-	// Force Connection: close so neither side reuses the connection;
-	// relay() forwards raw bytes and cannot route a second request.
-	type headerLine struct {
-		raw  string
-		name string
-	}
-	var headerLines []headerLine
-	var headerBytes int
-	nominated := map[string]bool{}
-	for {
-		line, err := readHTTPLine(br)
-		if err != nil {
-			respondLineTooLong(client, proto, err)
-			return
-		}
-		if strings.TrimRight(line, "\r\n") == "" {
-			break
-		}
-		headerBytes += len(line)
-		if headerBytes > maxHTTPHeaderBytes || len(headerLines) >= maxHTTPHeaderLines {
-			respondLineTooLong(client, proto, errHTTPLineTooLong)
-			return
-		}
-		name, value, ok := splitHeaderLine(line)
-		if !ok {
-			client.Write([]byte(proto + " 400 Bad Request\r\n\r\n"))
-			return
-		}
-		headerLines = append(headerLines, headerLine{raw: line, name: name})
-		if name == "connection" || name == "proxy-connection" {
-			for tok := range strings.SplitSeq(value, ",") {
-				if tok = strings.ToLower(strings.TrimSpace(tok)); tok != "" {
-					nominated[tok] = true
-				}
-			}
-		}
-	}
+	// Rewrite the request line to a relative path and force
+	// Connection: close so neither side reuses the connection; relay()
+	// forwards raw bytes and cannot route a second request.
+	var req strings.Builder
+	fmt.Fprintf(&req, "%s %s %s\r\n", method, u.RequestURI(), proto)
 	for _, h := range headerLines {
 		if hopByHopHeaders[h.name] || nominated[h.name] {
 			continue
 		}
-		remote.Write([]byte(h.raw))
+		req.WriteString(h.raw)
 	}
-	remote.Write([]byte("Connection: close\r\n\r\n"))
+	req.WriteString("Connection: close\r\n\r\n")
+	if _, err := io.WriteString(remote, req.String()); err != nil {
+		return
+	}
 
 	if err := client.SetReadDeadline(time.Time{}); err != nil {
 		return
 	}
 
-	// Flush any data already buffered by bufio.Reader before relaying.
-	if n := br.Buffered(); n > 0 {
-		buffered, _ := br.Peek(n)
-		if _, err := remote.Write(buffered); err != nil {
-			return
-		}
-		br.Discard(n)
-	}
-
-	relay(client, remote)
+	relayBuffered(client, remote, br)
 }
 
 // splitHeaderLine splits a raw header line into its lowercased field name
