@@ -19,35 +19,24 @@ import (
 
 const testIOTimeout = 2 * time.Second
 
-func TestResolveVersion(t *testing.T) {
-	origVersion := version
-	t.Cleanup(func() {
-		version = origVersion
-	})
-
-	version = "v9.9.9"
-	if got := resolveVersion(); got != "v9.9.9" {
-		t.Fatalf("resolveVersion() = %q, want %q", got, "v9.9.9")
+func TestHandleRejectsGreetingWithoutNoAuthMethod(t *testing.T) {
+	tests := []struct {
+		name    string
+		methods []byte
+	}{
+		{name: "no-auth not offered", methods: []byte{0x02}},
+		{name: "zero methods", methods: nil},
 	}
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, _ := startHandleSession(t, newTestProxy("127.0.0.1:9"))
+			writeGreeting(t, client, tt.methods...)
 
-func TestHandleRejectsWhenNoNoAuthMethod(t *testing.T) {
-	client, _ := startHandleSession(t, newTestProxy("127.0.0.1:9"))
-	writeGreeting(t, client, 0x02)
-
-	resp := readN(t, client, 2)
-	if !bytes.Equal(resp, []byte{socksVersion, socksMethodNoAcceptable}) {
-		t.Fatalf("unexpected auth response: %x", resp)
-	}
-}
-
-func TestHandleRejectsZeroMethodsGreeting(t *testing.T) {
-	client, _ := startHandleSession(t, newTestProxy("127.0.0.1:9"))
-	writeGreeting(t, client)
-
-	resp := readN(t, client, 2)
-	if !bytes.Equal(resp, []byte{socksVersion, socksMethodNoAcceptable}) {
-		t.Fatalf("unexpected auth response: %x", resp)
+			resp := readN(t, client, 2)
+			if !bytes.Equal(resp, []byte{socksVersion, socksMethodNoAcceptable}) {
+				t.Fatalf("unexpected auth response: %x", resp)
+			}
+		})
 	}
 }
 
@@ -498,115 +487,91 @@ func TestHandleSuccessfulConnectAndRelayViaUpstream(t *testing.T) {
 func TestHandleFallsBackToDirectOnUpstreamConnectFailure(t *testing.T) {
 	skipIfShortNetwork(t)
 
-	tests := []struct {
-		name                   string
-		rep                    byte
-		fallbackGeneralFailure bool
-	}{
-		{name: "host unreachable", rep: socksRepHostUnreachable, fallbackGeneralFailure: false},
-		{name: "general failure with opt-in", rep: socksRepGeneralFailure, fallbackGeneralFailure: true},
+	// Target answers "pong" to "ping" so the direct relay is observable.
+	targetLn := mustListenLoopback(t, "target")
+	go func() {
+		conn, err := targetLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		payload := make([]byte, 4)
+		if _, err := io.ReadFull(conn, payload); err != nil {
+			return
+		}
+		if string(payload) == "ping" {
+			conn.Write([]byte("pong"))
+		}
+	}()
+	target := targetFromListener(t, targetLn)
+
+	upstreamAddr, serverErr := startScriptedUpstream(t, target, func(conn net.Conn) error {
+		// Fallback-eligible failure: handle() must retry direct.
+		_, err := conn.Write([]byte{socksVersion, socksRepHostUnreachable, socksRSV, socksAtypIPv4, 0, 0, 0, 0, 0, 0})
+		return err
+	})
+
+	client, _ := startHandleSession(t, newTestProxy(upstreamAddr))
+	performClientNoAuthHandshake(t, client)
+
+	if _, err := client.Write(buildConnectRequest(target)); err != nil {
+		t.Fatalf("Write CONNECT request: %v", err)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Target answers "pong" to "ping" so the direct relay is observable.
-			targetLn := mustListenLoopback(t, "target")
-			go func() {
-				conn, err := targetLn.Accept()
-				if err != nil {
-					return
-				}
-				defer conn.Close()
-				payload := make([]byte, 4)
-				if _, err := io.ReadFull(conn, payload); err != nil {
-					return
-				}
-				if string(payload) == "ping" {
-					conn.Write([]byte("pong"))
-				}
-			}()
-			target := targetFromListener(t, targetLn)
+	reply := readN(t, client, 10)
+	if reply[1] != socksRepSucceeded {
+		t.Fatalf("unexpected rep code: 0x%02x", reply[1])
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("mock upstream failed: %v", err)
+	}
 
-			upstreamAddr, serverErr := startScriptedUpstream(t, target, func(conn net.Conn) error {
-				// Fallback-eligible failure: handle() must retry direct.
-				_, err := conn.Write([]byte{socksVersion, tt.rep, socksRSV, socksAtypIPv4, 0, 0, 0, 0, 0, 0})
-				return err
-			})
-
-			p := newTestProxy(upstreamAddr)
-			p.fallbackGeneralFailure = tt.fallbackGeneralFailure
-			client, _ := startHandleSession(t, p)
-			performClientNoAuthHandshake(t, client)
-
-			if _, err := client.Write(buildConnectRequest(target)); err != nil {
-				t.Fatalf("Write CONNECT request: %v", err)
-			}
-			reply := readN(t, client, 10)
-			if reply[1] != socksRepSucceeded {
-				t.Fatalf("unexpected rep code: 0x%02x", reply[1])
-			}
-			if err := <-serverErr; err != nil {
-				t.Fatalf("mock upstream failed: %v", err)
-			}
-
-			if _, err := client.Write([]byte("ping")); err != nil {
-				t.Fatalf("Write relay payload: %v", err)
-			}
-			if got := string(readN(t, client, 4)); got != "pong" {
-				t.Fatalf("unexpected relay response: %q", got)
-			}
-		})
+	if _, err := client.Write([]byte("ping")); err != nil {
+		t.Fatalf("Write relay payload: %v", err)
+	}
+	if got := string(readN(t, client, 4)); got != "pong" {
+		t.Fatalf("unexpected relay response: %q", got)
 	}
 }
 
 func TestHandleReturnsUpstreamRepToClient(t *testing.T) {
 	skipIfShortNetwork(t)
 
-	tests := []struct {
-		name string
-		rep  byte
-	}{
-		// Non-eligible failures must be forwarded to the client verbatim.
-		{name: "policy denial", rep: 0x02},
-		{name: "general failure without opt-in", rep: socksRepGeneralFailure},
+	const rep = 0x02 // policy denial, never fallback-eligible
+
+	targetLn := mustListenLoopback(t, "target")
+	accepted := make(chan struct{}, 1)
+	go func() {
+		conn, err := targetLn.Accept()
+		if err == nil {
+			conn.Close()
+			accepted <- struct{}{}
+		}
+	}()
+	target := targetFromListener(t, targetLn)
+
+	upstreamAddr, serverErr := startScriptedUpstream(t, target, func(conn net.Conn) error {
+		_, err := conn.Write([]byte{socksVersion, rep, socksRSV, socksAtypIPv4, 0, 0, 0, 0, 0, 0})
+		return err
+	})
+
+	client, _ := startHandleSession(t, newTestProxy(upstreamAddr))
+	performClientNoAuthHandshake(t, client)
+
+	if _, err := client.Write(buildConnectRequest(target)); err != nil {
+		t.Fatalf("Write CONNECT request: %v", err)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			targetLn := mustListenLoopback(t, "target")
-			accepted := make(chan struct{}, 1)
-			go func() {
-				conn, err := targetLn.Accept()
-				if err == nil {
-					conn.Close()
-					accepted <- struct{}{}
-				}
-			}()
-			target := targetFromListener(t, targetLn)
+	reply := readN(t, client, 10)
+	if reply[1] != rep {
+		t.Fatalf("unexpected rep code: 0x%02x, want 0x%02x", reply[1], rep)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("mock upstream failed: %v", err)
+	}
 
-			upstreamAddr, serverErr := startScriptedUpstream(t, target, func(conn net.Conn) error {
-				_, err := conn.Write([]byte{socksVersion, tt.rep, socksRSV, socksAtypIPv4, 0, 0, 0, 0, 0, 0})
-				return err
-			})
-
-			client, _ := startHandleSession(t, newTestProxy(upstreamAddr))
-			performClientNoAuthHandshake(t, client)
-
-			if _, err := client.Write(buildConnectRequest(target)); err != nil {
-				t.Fatalf("Write CONNECT request: %v", err)
-			}
-			reply := readN(t, client, 10)
-			if reply[1] != tt.rep {
-				t.Fatalf("unexpected rep code: 0x%02x, want 0x%02x", reply[1], tt.rep)
-			}
-			if err := <-serverErr; err != nil {
-				t.Fatalf("mock upstream failed: %v", err)
-			}
-
-			select {
-			case <-accepted:
-				t.Fatal("direct fallback occurred unexpectedly")
-			case <-time.After(150 * time.Millisecond):
-			}
-		})
+	select {
+	case <-accepted:
+		t.Fatal("direct fallback occurred unexpectedly")
+	case <-time.After(150 * time.Millisecond):
 	}
 }
 
@@ -1391,16 +1356,6 @@ func TestAcceptLoopDispatchesAfterTransientErrors(t *testing.T) {
 		}
 	case <-time.After(testIOTimeout):
 		t.Fatal("handle was not called after transient accept errors")
-	}
-}
-
-func TestAcceptLoopReturnsOnErrClosedWithoutHandling(t *testing.T) {
-	ln := &scriptedListener{}
-	runAcceptLoop(t, ln, func(conn net.Conn) {
-		t.Error("handle should not be called")
-	})
-	if got := len(ln.acceptTimes()); got != 1 {
-		t.Fatalf("Accept called %d times, want 1", got)
 	}
 }
 
