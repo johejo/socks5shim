@@ -19,12 +19,6 @@ import (
 
 const testIOTimeout = 2 * time.Second
 
-// unreachableTargetAddr is a request target for tests where the handler
-// rejects the headers before dialing, so no listener is needed. If a
-// regression makes the handler dial first, the refused connection turns
-// into a 502 and the status assertion fails.
-const unreachableTargetAddr = "127.0.0.1:9"
-
 func TestResolveVersion(t *testing.T) {
 	origVersion := version
 	t.Cleanup(func() {
@@ -987,34 +981,6 @@ func TestHandleHTTPPlainGET(t *testing.T) {
 	if string(body) != "OK" {
 		t.Fatalf("unexpected body: %q", body)
 	}
-}
-
-// The 431 itself comes from net/http; this test pins the MaxHeaderBytes
-// wiring in newHTTPServer, which caps the header section at
-// maxHTTPHeaderBytes instead of the stdlib's 1MiB default.
-func TestHandleHTTPRejectsOversizedHeaders(t *testing.T) {
-	client, done := startHandleHTTPSession(t, newTestProxy(unreachableTargetAddr))
-
-	// Write concurrently: it blocks once the server's buffer fills,
-	// leaving this goroutine free to read the 431. The padding must
-	// exceed MaxHeaderBytes plus the Server's 4KiB bufio slop.
-	var payload bytes.Buffer
-	payload.WriteString("CONNECT example.com:443 HTTP/1.1\r\n")
-	pad := strings.Repeat("a", 4<<10)
-	for i := 0; payload.Len() <= maxHTTPHeaderBytes+(8<<10); i++ {
-		fmt.Fprintf(&payload, "X-Pad-%d: %s\r\n", i, pad)
-	}
-	wrote := make(chan struct{})
-	go func() {
-		defer close(wrote)
-		client.Write(payload.Bytes())
-	}()
-
-	if status := readProxyStatus(t, client); status != 431 {
-		t.Fatalf("unexpected status: %d", status)
-	}
-	waitDone(t, done)
-	<-wrote
 }
 
 func TestHandleHTTPRejectsLowercaseConnect(t *testing.T) {

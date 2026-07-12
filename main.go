@@ -55,11 +55,6 @@ const (
 	defaultClientReadTimeout      = 5 * time.Second
 	directDialTimeout             = 10 * time.Second
 	upstreamUnavailableBackoff    = 3 * time.Second
-
-	// maxHTTPHeaderBytes bounds the request line plus header section,
-	// enforced as http.Server.MaxHeaderBytes (the Server grants itself
-	// 4KiB of bufio slop on top).
-	maxHTTPHeaderBytes = 64 << 10
 )
 
 var errAddressTypeNotSupported = errors.New("address type not supported")
@@ -612,7 +607,6 @@ func (p *proxy) newHTTPServer() *http.Server {
 	}
 	return &http.Server{
 		Handler:           p.httpHandler(rp),
-		MaxHeaderBytes:    maxHTTPHeaderBytes,
 		ReadHeaderTimeout: p.readTimeout(),
 		IdleTimeout:       2 * time.Minute,
 		// ReadTimeout and WriteTimeout stay zero: hijacked CONNECT
