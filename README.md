@@ -9,8 +9,10 @@ It accepts local SOCKS5 client connections, tries an upstream SOCKS5 proxy first
 - SOCKS5 `NO AUTH` method (`0x00`) support.
 - SOCKS5 `CONNECT` command support.
 - IPv4, IPv6, and domain target address support.
-- Upstream-first routing with automatic direct fallback.
+- Upstream-first routing with automatic direct fallback on retryable upstream failures.
 - Short backoff cache for unavailable upstream endpoints.
+
+A general failure reply (`0x01`) does not fall back by default since some upstreams use it for policy denials; pass `-fallback-on-general-failure` to restore the old always-fallback behavior.
 
 ## Requirements
 

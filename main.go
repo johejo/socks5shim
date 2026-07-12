@@ -93,10 +93,13 @@ func (e upstreamConnectError) Error() string {
 
 // fallbackEligible reports whether the reply code is a connection failure
 // that may not recur on a direct path, safe to retry. Deliberate rejections
-// (0x02) and capability mismatches (0x07/0x08) are not.
-func (e upstreamConnectError) fallbackEligible() bool {
+// (0x02) and capability mismatches (0x07/0x08) are not. General failure
+// (0x01) is ambiguous, so it falls back only when opted in.
+func (e upstreamConnectError) fallbackEligible(fallbackGeneralFailure bool) bool {
 	switch e.rep {
-	case socksRepGeneralFailure, socksRepNetworkUnreachable, socksRepHostUnreachable,
+	case socksRepGeneralFailure:
+		return fallbackGeneralFailure
+	case socksRepNetworkUnreachable, socksRepHostUnreachable,
 		socksRepConnectionRefused, socksRepTTLExpired:
 		return true
 	}
@@ -149,6 +152,7 @@ func main() {
 	upstream := flag.String("upstream", "127.0.0.1:1080", "upstream SOCKS5 proxy address")
 	dialTimeout := flag.Duration("dial-timeout", defaultUpstreamDialTimeout, "timeout for TCP connect and SOCKS5 greeting to upstream")
 	connectTimeout := flag.Duration("connect-timeout", defaultUpstreamConnectTimeout, "timeout for SOCKS5 CONNECT reply from upstream")
+	fallbackGeneralFailure := flag.Bool("fallback-on-general-failure", false, "fall back to direct on upstream CONNECT general failure (0x01)")
 	clientReadTimeout := flag.Duration("client-handshake-timeout", defaultClientReadTimeout, "timeout for reading SOCKS5 greeting/request from client")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
@@ -164,7 +168,7 @@ func main() {
 		}
 		log.Printf("HTTP proxy listening on %s, upstream %s (dial-timeout %s, connect-timeout %s)", *httpListen, *upstream, *dialTimeout, *connectTimeout)
 		go acceptLoop(httpLn, "http", func(conn net.Conn) {
-			handleHTTP(conn, *upstream, *dialTimeout, *connectTimeout, *clientReadTimeout)
+			handleHTTP(conn, *upstream, *dialTimeout, *connectTimeout, *clientReadTimeout, *fallbackGeneralFailure)
 		})
 	}
 
@@ -175,7 +179,7 @@ func main() {
 	log.Printf("SOCKS5 listening on %s, upstream %s (dial-timeout %s, connect-timeout %s)", *listen, *upstream, *dialTimeout, *connectTimeout)
 
 	acceptLoop(ln, "socks5", func(conn net.Conn) {
-		handle(conn, *upstream, *dialTimeout, *connectTimeout, *clientReadTimeout)
+		handle(conn, *upstream, *dialTimeout, *connectTimeout, *clientReadTimeout, *fallbackGeneralFailure)
 	})
 }
 
@@ -226,7 +230,7 @@ type socks5Target struct {
 	addr   string // host:port for dialing
 }
 
-func handle(client net.Conn, upstream string, dialTimeout, connectTimeout, clientReadTimeout time.Duration) {
+func handle(client net.Conn, upstream string, dialTimeout, connectTimeout, clientReadTimeout time.Duration, fallbackGeneralFailure bool) {
 	defer client.Close()
 	if clientReadTimeout <= 0 {
 		clientReadTimeout = defaultClientReadTimeout
@@ -287,7 +291,7 @@ func handle(client net.Conn, upstream string, dialTimeout, connectTimeout, clien
 	}
 
 	// --- Try upstream, fallback to direct ---
-	remote, viaUpstream, err := dial(upstream, target, dialTimeout, connectTimeout)
+	remote, viaUpstream, err := dial(upstream, target, dialTimeout, connectTimeout, fallbackGeneralFailure)
 	if err != nil {
 		log.Printf("FAIL %s: %v", target.addr, err)
 		var upstreamErr upstreamConnectError
@@ -388,7 +392,7 @@ func replyCodeFromDialError(err error) byte {
 }
 
 // dial tries the upstream SOCKS5 proxy first; on failure, connects directly.
-func dial(upstream string, target socks5Target, helloTimeout, connectTimeout time.Duration) (net.Conn, bool, error) {
+func dial(upstream string, target socks5Target, helloTimeout, connectTimeout time.Duration, fallbackGeneralFailure bool) (net.Conn, bool, error) {
 	if upstreamBackoffCache.shouldSkip(upstream, time.Now()) {
 		return dialDirect(target)
 	}
@@ -400,7 +404,7 @@ func dial(upstream string, target socks5Target, helloTimeout, connectTimeout tim
 	}
 	var connectErr upstreamConnectError
 	if errors.As(err, &connectErr) {
-		if !connectErr.fallbackEligible() {
+		if !connectErr.fallbackEligible(fallbackGeneralFailure) {
 			return nil, false, err
 		}
 		// The greeting succeeded, so the upstream is alive: fall back
@@ -577,7 +581,7 @@ func sendReplyWithBind(w io.Writer, rep byte, bind net.Addr) {
 	w.Write([]byte{socksVersion, rep, socksRSV, socksAtypIPv4, 0, 0, 0, 0, 0, 0})
 }
 
-func handleHTTP(client net.Conn, upstream string, dialTimeout, connectTimeout, clientReadTimeout time.Duration) {
+func handleHTTP(client net.Conn, upstream string, dialTimeout, connectTimeout, clientReadTimeout time.Duration, fallbackGeneralFailure bool) {
 	defer client.Close()
 	if clientReadTimeout <= 0 {
 		clientReadTimeout = defaultClientReadTimeout
@@ -606,9 +610,9 @@ func handleHTTP(client net.Conn, upstream string, dialTimeout, connectTimeout, c
 	}
 
 	if strings.ToUpper(method) == "CONNECT" {
-		handleHTTPConnect(client, br, uri, proto, upstream, dialTimeout, connectTimeout)
+		handleHTTPConnect(client, br, uri, proto, upstream, dialTimeout, connectTimeout, fallbackGeneralFailure)
 	} else {
-		handleHTTPPlain(client, br, method, uri, proto, upstream, dialTimeout, connectTimeout)
+		handleHTTPPlain(client, br, method, uri, proto, upstream, dialTimeout, connectTimeout, fallbackGeneralFailure)
 	}
 }
 
@@ -632,7 +636,7 @@ func respondLineTooLong(client net.Conn, proto string, err error) {
 	}
 }
 
-func handleHTTPConnect(client net.Conn, br *bufio.Reader, uri, proto, upstream string, dialTimeout, connectTimeout time.Duration) {
+func handleHTTPConnect(client net.Conn, br *bufio.Reader, uri, proto, upstream string, dialTimeout, connectTimeout time.Duration, fallbackGeneralFailure bool) {
 	// Read and discard headers until empty line, still bounding the total
 	// so a client cannot stream junk until the read deadline.
 	var headerBytes, headerCount int
@@ -660,7 +664,7 @@ func handleHTTPConnect(client net.Conn, br *bufio.Reader, uri, proto, upstream s
 	}
 
 	target := buildHTTPTarget(host, port)
-	remote, viaUpstream, err := dial(upstream, target, dialTimeout, connectTimeout)
+	remote, viaUpstream, err := dial(upstream, target, dialTimeout, connectTimeout, fallbackGeneralFailure)
 	if err != nil {
 		log.Printf("HTTP CONNECT FAIL %s: %v", target.addr, err)
 		client.Write([]byte(proto + " 502 Bad Gateway\r\n\r\n"))
@@ -691,7 +695,7 @@ func handleHTTPConnect(client net.Conn, br *bufio.Reader, uri, proto, upstream s
 	relay(client, remote)
 }
 
-func handleHTTPPlain(client net.Conn, br *bufio.Reader, method, uri, proto, upstream string, dialTimeout, connectTimeout time.Duration) {
+func handleHTTPPlain(client net.Conn, br *bufio.Reader, method, uri, proto, upstream string, dialTimeout, connectTimeout time.Duration, fallbackGeneralFailure bool) {
 	u, err := url.Parse(uri)
 	if err != nil || u.Scheme != "http" || u.Host == "" {
 		client.Write([]byte(proto + " 400 Bad Request\r\n\r\n"))
@@ -705,7 +709,7 @@ func handleHTTPPlain(client net.Conn, br *bufio.Reader, method, uri, proto, upst
 	}
 
 	target := buildHTTPTarget(host, port)
-	remote, viaUpstream, err := dial(upstream, target, dialTimeout, connectTimeout)
+	remote, viaUpstream, err := dial(upstream, target, dialTimeout, connectTimeout, fallbackGeneralFailure)
 	if err != nil {
 		log.Printf("HTTP PLAIN FAIL %s: %v", target.addr, err)
 		client.Write([]byte(proto + " 502 Bad Gateway\r\n\r\n"))
