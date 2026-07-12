@@ -1,0 +1,159 @@
+package main
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"syscall"
+	"testing"
+	"time"
+)
+
+const testIOTimeout = 2 * time.Second
+
+// newTestProxy returns a proxy with a fresh backoff cache and generous
+// timeouts; tests exercising timeout expiry override individual fields.
+func newTestProxy(upstream string) *proxy {
+	return &proxy{
+		upstream:          upstream,
+		dialTimeout:       testIOTimeout,
+		connectTimeout:    testIOTimeout,
+		clientReadTimeout: testIOTimeout,
+		backoff:           newUpstreamBackoffState(upstreamUnavailableBackoff),
+	}
+}
+
+func performUpstreamNoAuthHandshake(conn net.Conn, target socks5Target) error {
+	greeting := make([]byte, socksGreetingHeaderLen+1)
+	if _, err := io.ReadFull(conn, greeting); err != nil {
+		return err
+	}
+	if !bytes.Equal(greeting, []byte{socksVersion, socksMethodSelectionCount, socksMethodNoAuth}) {
+		return fmt.Errorf("unexpected upstream greeting: %x", greeting)
+	}
+	if _, err := conn.Write([]byte{socksVersion, socksMethodNoAuth}); err != nil {
+		return err
+	}
+
+	expectedReq := buildConnectRequest(target)
+	req := make([]byte, len(expectedReq))
+	if _, err := io.ReadFull(conn, req); err != nil {
+		return err
+	}
+	if !bytes.Equal(req, expectedReq) {
+		return fmt.Errorf("unexpected CONNECT request: %x", req)
+	}
+	return nil
+}
+
+// startScriptedUpstream starts a mock SOCKS5 upstream that accepts one
+// connection, verifies the greeting and CONNECT request for target, then
+// runs script on the connection. The returned channel receives the script's
+// result (or the earlier accept/handshake error).
+func startScriptedUpstream(t *testing.T, target socks5Target, script func(net.Conn) error) (addr string, serverErr chan error) {
+	t.Helper()
+	ln := mustListenLoopback(t, "upstream")
+	serverErr = make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+		if err := performUpstreamNoAuthHandshake(conn, target); err != nil {
+			serverErr <- err
+			return
+		}
+		serverErr <- script(conn)
+	}()
+	return ln.Addr().String(), serverErr
+}
+
+func readN(t *testing.T, r io.Reader, n int) []byte {
+	t.Helper()
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		t.Fatalf("ReadFull(%d): %v", n, err)
+	}
+	return buf
+}
+
+func waitDone(t *testing.T, done <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting handler to exit")
+	}
+}
+
+func skipIfShortNetwork(t *testing.T) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping network access test in -short mode")
+	}
+}
+
+func testClientServer(t *testing.T) (client net.Conn, server net.Conn) {
+	t.Helper()
+	client, server = net.Pipe()
+	t.Cleanup(func() {
+		client.Close()
+		server.Close()
+	})
+	return client, server
+}
+
+func mustListenLoopback(t *testing.T, name string) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		if isPermissionDenied(err) {
+			t.Skipf("skipping %s bind test in restricted environment: %v", name, err)
+		}
+		t.Fatalf("Listen %s: %v", name, err)
+	}
+	t.Cleanup(func() {
+		ln.Close()
+	})
+	return ln
+}
+
+func targetFromListener(t *testing.T, ln net.Listener) socks5Target {
+	t.Helper()
+	tcpAddr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("expected *net.TCPAddr, got %T", ln.Addr())
+	}
+	addrPort := tcpAddr.AddrPort()
+	return socks5Target{
+		atyp: socksAtypIPv4,
+		ip:   addrPort.Addr().Unmap(),
+		port: addrPort.Port(),
+		addr: addrPort.String(),
+	}
+}
+
+func setDeadline(t *testing.T, conn net.Conn, timeout time.Duration) {
+	t.Helper()
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		t.Fatalf("SetDeadline: %v", err)
+	}
+}
+
+func isPermissionDenied(err error) bool {
+	if errors.Is(err, os.ErrPermission) {
+		return true
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errno == syscall.EPERM || errno == syscall.EACCES
+	}
+	return false
+}
