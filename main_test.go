@@ -714,22 +714,67 @@ func startHandleSession(t *testing.T, p *proxy) (net.Conn, chan struct{}) {
 	return client, done
 }
 
-// startHandleHTTPSession is startHandleSession for the HTTP handler.
+// startHandleHTTPSession serves one in-memory connection with the proxy's
+// HTTP server and returns the client end plus a channel closed when the
+// server tears the connection down (or hands it off via Hijack).
 func startHandleHTTPSession(t *testing.T, p *proxy) (net.Conn, chan struct{}) {
 	t.Helper()
 	client, server := testClientServer(t)
 	done := make(chan struct{})
-	go func() {
-		p.handleHTTP(server)
-		close(done)
-	}()
+	var once sync.Once
+	srv := p.newHTTPServer()
+	srv.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateClosed || state == http.StateHijacked {
+			once.Do(func() { close(done) })
+		}
+	}
+	go srv.Serve(newOneShotListener(server))
 	setDeadline(t, client, testIOTimeout)
 	t.Cleanup(func() {
 		client.Close()
+		srv.Close()
 		waitDone(t, done)
 	})
 	return client, done
 }
+
+// oneShotListener yields a single pre-made connection to a Server, then
+// blocks until closed.
+type oneShotListener struct {
+	mu   sync.Mutex
+	conn net.Conn
+	addr net.Addr
+	done chan struct{}
+}
+
+func newOneShotListener(conn net.Conn) *oneShotListener {
+	return &oneShotListener{conn: conn, addr: conn.LocalAddr(), done: make(chan struct{})}
+}
+
+func (l *oneShotListener) Accept() (net.Conn, error) {
+	l.mu.Lock()
+	conn := l.conn
+	l.conn = nil
+	l.mu.Unlock()
+	if conn != nil {
+		return conn, nil
+	}
+	<-l.done
+	return nil, net.ErrClosed
+}
+
+func (l *oneShotListener) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	select {
+	case <-l.done:
+	default:
+		close(l.done)
+	}
+	return nil
+}
+
+func (l *oneShotListener) Addr() net.Addr { return l.addr }
 
 func writeGreeting(t *testing.T, client net.Conn, methods ...byte) {
 	t.Helper()
@@ -1001,7 +1046,10 @@ func TestHandleHTTPPlainStripsWellKnownHopByHopHeaders(t *testing.T) {
 	fmt.Fprintf(conn, "GET http://%s/ HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nTE: trailers\r\nProxy-Authenticate: Basic\r\nTrailer: Expires\r\nConnection: close\r\n\r\n", targetAddr, targetAddr)
 
 	body := readProxyResponseBody(t, conn)
-	for _, want := range []string{`upgrade=""`, `te=""`, `proxy-authenticate=""`, `trailer=""`} {
+	// TE is hop-by-hop, but httputil.ReverseProxy deliberately re-adds
+	// "Te: trailers" when the client announced it, to keep trailer
+	// support working end to end.
+	for _, want := range []string{`upgrade=""`, `te="trailers"`, `proxy-authenticate=""`, `trailer=""`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("hop-by-hop header was not stripped, want %s in: %s", want, body)
 		}
@@ -1036,13 +1084,14 @@ func TestHandleHTTPPlainRejectsOversizedHeaders(t *testing.T) {
 	proxyAddr := startHTTPProxyStack(t, "")
 	conn := dialHTTPProxy(t, proxyAddr)
 
-	// Write concurrently: it blocks once the handler's buffer fills,
-	// leaving this goroutine free to read the 431.
+	// Write concurrently: it blocks once the server's buffer fills,
+	// leaving this goroutine free to read the 431. The padding must
+	// exceed MaxHeaderBytes plus the Server's 4KiB bufio slop.
 	targetAddr := unreachableTargetAddr
 	var payload bytes.Buffer
 	fmt.Fprintf(&payload, "GET http://%s/ HTTP/1.1\r\nHost: %s\r\n", targetAddr, targetAddr)
 	pad := strings.Repeat("a", 4<<10)
-	for i := 0; payload.Len() <= maxHTTPHeaderBytes; i++ {
+	for i := 0; payload.Len() <= maxHTTPHeaderBytes+(8<<10); i++ {
 		fmt.Fprintf(&payload, "X-Pad-%d: %s\r\n", i, pad)
 	}
 	payload.WriteString("\r\n")
@@ -1092,12 +1141,13 @@ func TestHandleHTTPPlainRejectsMalformedHeaders(t *testing.T) {
 func TestHandleHTTPConnectRejectsOversizedHeaders(t *testing.T) {
 	client, done := startHandleHTTPSession(t, newTestProxy(unreachableTargetAddr))
 
-	// Write concurrently: it blocks once the handler's buffer fills,
-	// leaving this goroutine free to read the 431.
+	// Write concurrently: it blocks once the server's buffer fills,
+	// leaving this goroutine free to read the 431. The padding must
+	// exceed MaxHeaderBytes plus the Server's 4KiB bufio slop.
 	var payload bytes.Buffer
 	payload.WriteString("CONNECT example.com:443 HTTP/1.1\r\n")
 	pad := strings.Repeat("a", 4<<10)
-	for i := 0; payload.Len() <= maxHTTPHeaderBytes; i++ {
+	for i := 0; payload.Len() <= maxHTTPHeaderBytes+(8<<10); i++ {
 		fmt.Fprintf(&payload, "X-Pad-%d: %s\r\n", i, pad)
 	}
 	wrote := make(chan struct{})
@@ -1117,27 +1167,29 @@ func TestHandleHTTPRejectsSmugglingHeaders(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		headers string
+		status  int
 	}{
-		{"multiple Host headers", "Host: a.example\r\nHost: b.example\r\n"},
-		{"differing duplicate Content-Length", "Host: example.com\r\nContent-Length: 1\r\nContent-Length: 2\r\n"},
-		{"invalid Content-Length", "Host: example.com\r\nContent-Length: abc\r\n"},
-		{"unsupported Transfer-Encoding", "Host: example.com\r\nTransfer-Encoding: gzip\r\n"},
+		{"multiple Host headers", "Host: a.example\r\nHost: b.example\r\n", 400},
+		{"differing duplicate Content-Length", "Host: example.com\r\nContent-Length: 1\r\nContent-Length: 2\r\n", 400},
+		{"invalid Content-Length", "Host: example.com\r\nContent-Length: abc\r\n", 400},
+		// A transfer coding the server does not understand gets 501 per
+		// RFC 7230 §3.3.1.
+		{"unsupported Transfer-Encoding", "Host: example.com\r\nTransfer-Encoding: gzip\r\n", 501},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			client, done := startHandleHTTPSession(t, newTestProxy("127.0.0.1:9"))
+			client, _ := startHandleHTTPSession(t, newTestProxy("127.0.0.1:9"))
 
 			fmt.Fprintf(client, "GET http://example.com/ HTTP/1.1\r\n%s\r\n", tc.headers)
 
-			if status := readProxyStatus(t, client); status != 400 {
-				t.Fatalf("unexpected status: %d", status)
+			if status := readProxyStatus(t, client); status != tc.status {
+				t.Fatalf("unexpected status: %d, want %d", status, tc.status)
 			}
-			waitDone(t, done)
 		})
 	}
 }
 
 func TestHandleHTTPRejectsLowercaseConnect(t *testing.T) {
-	client, done := startHandleHTTPSession(t, newTestProxy("127.0.0.1:9"))
+	client, _ := startHandleHTTPSession(t, newTestProxy("127.0.0.1:9"))
 
 	// Methods are case-sensitive (RFC 9110 §9.1): lowercase connect is
 	// not CONNECT, and its authority-form target is not absolute-form
@@ -1147,7 +1199,6 @@ func TestHandleHTTPRejectsLowercaseConnect(t *testing.T) {
 	if status := readProxyStatus(t, client); status != 400 {
 		t.Fatalf("unexpected status: %d", status)
 	}
-	waitDone(t, done)
 }
 
 func TestHandleHTTPPlainDropsContentLengthWithChunked(t *testing.T) {
@@ -1204,50 +1255,46 @@ func TestHandleHTTPPlainNormalizesObsFold(t *testing.T) {
 	}
 }
 
-func TestHandleHTTPPlainForcesConnectionClose(t *testing.T) {
+func TestHandleHTTPPlainKeepAlive(t *testing.T) {
 	skipIfShortNetwork(t)
 
-	connHeader := make(chan string, 1)
-	keepAliveHeader := make(chan string, 1)
+	connHeader := make(chan string, 2)
+	keepAliveHeader := make(chan string, 2)
 	targetAddr := startKeepAliveTarget(t, func(req *http.Request) string {
-		select {
-		case connHeader <- req.Header.Get("Connection"):
-		default:
-		}
-		select {
-		case keepAliveHeader <- req.Header.Get("Keep-Alive"):
-		default:
-		}
+		connHeader <- req.Header.Get("Connection")
+		keepAliveHeader <- req.Header.Get("Keep-Alive")
 		return "OK"
 	})
 
 	proxyAddr := startHTTPProxyStack(t, "")
 	conn := dialHTTPProxy(t, proxyAddr)
-
-	fmt.Fprintf(conn, "GET http://%s/ HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5, max=100\r\n\r\n", targetAddr, targetAddr)
-
 	br := bufio.NewReader(conn)
-	resp, err := http.ReadResponse(br, nil)
-	if err != nil {
-		t.Fatalf("read response: %v", err)
-	}
-	if _, err := io.ReadAll(resp.Body); err != nil {
-		t.Fatalf("read body: %v", err)
-	}
-	resp.Body.Close()
 
-	if got := <-connHeader; got != "close" {
-		t.Fatalf("target received Connection: %q, want %q", got, "close")
-	}
-	if got := <-keepAliveHeader; got != "" {
-		t.Fatalf("Keep-Alive was not stripped: %q", got)
-	}
+	// Two requests on the same client connection: the proxy keeps the
+	// connection alive and routes each request, while the hop-by-hop
+	// Connection/Keep-Alive headers never reach the target.
+	for i := range 2 {
+		fmt.Fprintf(conn, "GET http://%s/ HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5, max=100\r\n\r\n", targetAddr, targetAddr)
 
-	// The proxy must close the client connection after the response so a
-	// second request cannot be misrouted to the first target.
-	setDeadline(t, conn, testIOTimeout)
-	if _, err := br.ReadByte(); err != io.EOF {
-		t.Fatalf("expected EOF after response, got %v", err)
+		resp, err := http.ReadResponse(br, nil)
+		if err != nil {
+			t.Fatalf("read response %d: %v", i+1, err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read body %d: %v", i+1, err)
+		}
+		resp.Body.Close()
+		if string(body) != "OK" {
+			t.Fatalf("unexpected body %d: %q", i+1, body)
+		}
+
+		if got := <-connHeader; got != "" {
+			t.Fatalf("target received Connection: %q, want empty", got)
+		}
+		if got := <-keepAliveHeader; got != "" {
+			t.Fatalf("Keep-Alive was not stripped: %q", got)
+		}
 	}
 }
 
@@ -1304,20 +1351,18 @@ func TestHandleHTTPPlainSecondRequestNotMisrouted(t *testing.T) {
 }
 
 func TestHandleHTTPRejectsInvalidProto(t *testing.T) {
-	client, done := startHandleHTTPSession(t, newTestProxy("127.0.0.1:9"))
+	client, _ := startHandleHTTPSession(t, newTestProxy("127.0.0.1:9"))
 
 	// Send a request with an unsupported protocol version.
 	fmt.Fprintf(client, "GET / HTTP/2.0\r\nHost: example.com\r\n\r\n")
 
-	// The handler closes the connection without a response.
-	if _, err := bufio.NewReader(client).ReadByte(); err != io.EOF {
-		t.Fatalf("expected silent close, got %v", err)
+	if status := readProxyStatus(t, client); status != 505 {
+		t.Fatalf("unexpected status: %d", status)
 	}
-	waitDone(t, done)
 }
 
 func TestHandleHTTPRejectsNonTokenMethod(t *testing.T) {
-	client, done := startHandleHTTPSession(t, newTestProxy("127.0.0.1:9"))
+	client, _ := startHandleHTTPSession(t, newTestProxy("127.0.0.1:9"))
 
 	// Send a request whose method is not a valid token.
 	fmt.Fprintf(client, "GE\x00T / HTTP/1.1\r\nHost: example.com\r\n\r\n")
@@ -1325,7 +1370,6 @@ func TestHandleHTTPRejectsNonTokenMethod(t *testing.T) {
 	if status := readProxyStatus(t, client); status != 400 {
 		t.Fatalf("unexpected status: %d", status)
 	}
-	waitDone(t, done)
 }
 
 func TestHandleHTTPRejectsInvalidHostLength(t *testing.T) {
@@ -1337,14 +1381,13 @@ func TestHandleHTTPRejectsInvalidHostLength(t *testing.T) {
 		{"oversized host", strings.Repeat("a", 256) + ":443"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			client, done := startHandleHTTPSession(t, newTestProxy("127.0.0.1:9"))
+			client, _ := startHandleHTTPSession(t, newTestProxy("127.0.0.1:9"))
 
 			fmt.Fprintf(client, "CONNECT %s HTTP/1.1\r\nHost: example.com\r\n\r\n", tc.uri)
 
 			if status := readProxyStatus(t, client); status != 400 {
 				t.Fatalf("unexpected status: %d", status)
 			}
-			waitDone(t, done)
 		})
 	}
 }
@@ -1359,14 +1402,13 @@ func TestHandleHTTPPlainRejectsNonHTTPScheme(t *testing.T) {
 		{"empty scheme", "//example.com/"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			client, done := startHandleHTTPSession(t, newTestProxy("127.0.0.1:9"))
+			client, _ := startHandleHTTPSession(t, newTestProxy("127.0.0.1:9"))
 
 			fmt.Fprintf(client, "GET %s HTTP/1.1\r\nHost: example.com\r\n\r\n", tc.uri)
 
 			if status := readProxyStatus(t, client); status != 400 {
 				t.Fatalf("unexpected status: %d", status)
 			}
-			waitDone(t, done)
 		})
 	}
 }
@@ -1374,9 +1416,10 @@ func TestHandleHTTPPlainRejectsNonHTTPScheme(t *testing.T) {
 func TestHandleHTTPRejectsOversizedRequestLine(t *testing.T) {
 	client, done := startHandleHTTPSession(t, newTestProxy("127.0.0.1:9"))
 
-	// Write concurrently: it blocks once the handler's buffer fills,
-	// leaving this goroutine free to read the 431.
-	payload := append([]byte("GET /"), bytes.Repeat([]byte("a"), maxHTTPHeaderBytes+1)...)
+	// Write concurrently: it blocks once the server's buffer fills,
+	// leaving this goroutine free to read the 431. The padding must
+	// exceed MaxHeaderBytes plus the Server's 4KiB bufio slop.
+	payload := append([]byte("GET /"), bytes.Repeat([]byte("a"), maxHTTPHeaderBytes+(8<<10))...)
 	wrote := make(chan struct{})
 	go func() {
 		defer close(wrote)
@@ -1608,15 +1651,9 @@ func startHTTPProxyStack(t *testing.T, fixedTarget string) string {
 
 	p := newTestProxy(upstreamLn.Addr().String())
 	httpLn := mustListenLoopback(t, "http-proxy")
-	go func() {
-		for {
-			conn, err := httpLn.Accept()
-			if err != nil {
-				return
-			}
-			go p.handleHTTP(conn)
-		}
-	}()
+	srv := p.newHTTPServer()
+	go srv.Serve(httpLn)
+	t.Cleanup(func() { srv.Close() })
 	return httpLn.Addr().String()
 }
 
