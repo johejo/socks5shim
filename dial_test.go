@@ -89,50 +89,26 @@ func TestDialDoesNotFallbackOnUpstreamAuthRejection(t *testing.T) {
 	}
 }
 
+// Every CONNECT failure reply, defined (0x01-0x08) or undefined (0x09), is
+// relayed to the caller verbatim, never bypassed via a direct fallback.
 func TestDialDoesNotFallbackOnUpstreamConnectFailure(t *testing.T) {
 	skipIfShortNetwork(t)
 
-	tests := []struct {
-		name                   string
-		rep                    byte
-		fallbackGeneralFailure bool
-	}{
-		{name: "policy denial", rep: 0x02, fallbackGeneralFailure: false},
-		{name: "policy denial with general-failure fallback enabled", rep: 0x02, fallbackGeneralFailure: true},
-		{name: "general failure without opt-in", rep: socksRepGeneralFailure, fallbackGeneralFailure: false},
+	reps := []byte{
+		socksRepGeneralFailure,      // 0x01
+		0x02,                        // policy denial
+		socksRepNetworkUnreachable,  // 0x03
+		socksRepHostUnreachable,     // 0x04
+		socksRepConnectionRefused,   // 0x05
+		socksRepTTLExpired,          // 0x06
+		socksRepCommandNotSupported, // 0x07
+		socksRepAddressTypeNotSupp,  // 0x08
+		0x09,                        // undefined
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			fx := startDialFallbackFixture(t, []byte{socksVersion, tt.rep, socksRSV, socksAtypIPv4})
-			fx.p.fallbackGeneralFailure = tt.fallbackGeneralFailure
-			fx.assertNoFallback(t, tt.rep)
-			if fx.p.backoff.shouldSkip(fx.p.upstream, time.Now()) {
-				t.Fatal("backoff cache must not be marked on CONNECT rep failure")
-			}
-		})
-	}
-}
-
-func TestDialFallsBackOnUpstreamDialFailure(t *testing.T) {
-	skipIfShortNetwork(t)
-
-	tests := []struct {
-		name                   string
-		rep                    byte
-		fallbackGeneralFailure bool
-	}{
-		{name: "general failure with opt-in", rep: socksRepGeneralFailure, fallbackGeneralFailure: true},
-		{name: "network unreachable", rep: socksRepNetworkUnreachable},
-		{name: "host unreachable", rep: socksRepHostUnreachable},
-		{name: "connection refused", rep: socksRepConnectionRefused},
-		{name: "ttl expired", rep: socksRepTTLExpired},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Upstream-side dial failure.
-			fx := startDialFallbackFixture(t, []byte{socksVersion, tt.rep, socksRSV, socksAtypIPv4, 0, 0, 0, 0, 0, 0})
-			fx.p.fallbackGeneralFailure = tt.fallbackGeneralFailure
-			fx.assertDirectFallback(t)
+	for _, rep := range reps {
+		t.Run(fmt.Sprintf("rep_0x%02x", rep), func(t *testing.T) {
+			fx := startDialFallbackFixture(t, []byte{socksVersion, rep, socksRSV, socksAtypIPv4})
+			fx.assertNoFallback(t, rep)
 			if fx.p.backoff.shouldSkip(fx.p.upstream, time.Now()) {
 				t.Fatal("backoff cache must not be marked on CONNECT rep failure")
 			}
@@ -181,18 +157,7 @@ func startDialFallbackFixture(t *testing.T, connectReply []byte) dialFallbackFix
 func startDialFallbackFixtureScript(t *testing.T, script func(net.Conn) error) dialFallbackFixture {
 	t.Helper()
 
-	targetLn := mustListenLoopback(t, "target")
-	target := targetFromListener(t, targetLn)
-
-	accepted := make(chan struct{}, 1)
-	go func() {
-		conn, err := targetLn.Accept()
-		if err == nil {
-			conn.Close()
-			accepted <- struct{}{}
-		}
-	}()
-
+	target, accepted := startWatchedTarget(t)
 	upstreamAddr, serverErr := startScriptedUpstream(t, target, script)
 
 	return dialFallbackFixture{
@@ -248,11 +213,7 @@ func (fx dialFallbackFixture) assertNoFallback(t *testing.T, wantRep byte) {
 		t.Fatalf("mock upstream failed: %v", err)
 	}
 
-	select {
-	case <-fx.accepted:
-		t.Fatal("direct fallback occurred unexpectedly")
-	case <-time.After(150 * time.Millisecond):
-	}
+	assertNoDirectConnection(t, fx.accepted)
 }
 
 // TestDialCanceledDuringUpstreamHandshake guards the cancellation contract:

@@ -18,7 +18,6 @@ func main() {
 	upstream := flag.String("upstream", "127.0.0.1:1080", "upstream SOCKS5 proxy address")
 	dialTimeout := flag.Duration("dial-timeout", defaultUpstreamDialTimeout, "timeout for TCP connect and SOCKS5 greeting to upstream")
 	connectTimeout := flag.Duration("connect-timeout", defaultUpstreamConnectTimeout, "timeout for SOCKS5 CONNECT reply from upstream")
-	fallbackGeneralFailure := flag.Bool("fallback-on-general-failure", false, "fall back to direct on upstream CONNECT general failure (0x01)")
 	clientReadTimeout := flag.Duration("client-handshake-timeout", defaultClientReadTimeout, "timeout for reading SOCKS5 greeting/request from client")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
@@ -28,12 +27,11 @@ func main() {
 	}
 
 	p := &proxy{
-		upstream:               *upstream,
-		dialTimeout:            *dialTimeout,
-		connectTimeout:         *connectTimeout,
-		clientReadTimeout:      *clientReadTimeout,
-		fallbackGeneralFailure: *fallbackGeneralFailure,
-		backoff:                newUpstreamBackoffState(upstreamUnavailableBackoff),
+		upstream:          *upstream,
+		dialTimeout:       *dialTimeout,
+		connectTimeout:    *connectTimeout,
+		clientReadTimeout: *clientReadTimeout,
+		backoff:           newUpstreamBackoffState(upstreamUnavailableBackoff),
 	}
 
 	if *httpListen != "" {

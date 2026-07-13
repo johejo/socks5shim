@@ -180,6 +180,35 @@ func targetFromListener(t *testing.T, ln net.Listener) socks5Target {
 	}
 }
 
+// startWatchedTarget starts a reachable target listener that signals on the
+// returned channel when it is dialed, so tests can assert whether a direct
+// connection to the target happened.
+func startWatchedTarget(t *testing.T) (socks5Target, chan struct{}) {
+	t.Helper()
+	ln := mustListenLoopback(t, "target")
+	accepted := make(chan struct{}, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err == nil {
+			conn.Close()
+			accepted <- struct{}{}
+		}
+	}()
+	return targetFromListener(t, ln), accepted
+}
+
+// assertNoDirectConnection fails the test if the watched target accepts a
+// connection within a short grace window: relaying an upstream verdict must
+// not leak an unrequested direct connection alongside it.
+func assertNoDirectConnection(t *testing.T, accepted chan struct{}) {
+	t.Helper()
+	select {
+	case <-accepted:
+		t.Fatal("direct fallback occurred unexpectedly")
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
 func setDeadline(t *testing.T, conn net.Conn, timeout time.Duration) {
 	t.Helper()
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {

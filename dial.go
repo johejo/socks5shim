@@ -26,12 +26,11 @@ var errUpstreamAuth = errors.New("upstream rejected credentials")
 // proxy holds the routing configuration and upstream backoff state shared by
 // the SOCKS5 and HTTP handlers.
 type proxy struct {
-	upstream               string
-	dialTimeout            time.Duration // TCP connect + SOCKS5 greeting to upstream
-	connectTimeout         time.Duration // SOCKS5 CONNECT reply from upstream
-	clientReadTimeout      time.Duration // client greeting/request reads
-	fallbackGeneralFailure bool
-	backoff                *upstreamBackoffState
+	upstream          string
+	dialTimeout       time.Duration // TCP connect + SOCKS5 greeting to upstream
+	connectTimeout    time.Duration // SOCKS5 CONNECT reply from upstream
+	clientReadTimeout time.Duration // client greeting/request reads
+	backoff           *upstreamBackoffState
 }
 
 func (p *proxy) readTimeout() time.Duration {
@@ -47,21 +46,6 @@ type upstreamConnectError struct {
 
 func (e upstreamConnectError) Error() string {
 	return fmt.Sprintf("upstream CONNECT failed: rep=0x%02x", e.rep)
-}
-
-// fallbackEligible reports whether the reply code is a connection failure
-// that may not recur on a direct path, safe to retry. Deliberate rejections
-// (0x02) and capability mismatches (0x07/0x08) are not. General failure
-// (0x01) is ambiguous, so it falls back only when opted in.
-func (e upstreamConnectError) fallbackEligible(fallbackGeneralFailure bool) bool {
-	switch e.rep {
-	case socksRepGeneralFailure:
-		return fallbackGeneralFailure
-	case socksRepNetworkUnreachable, socksRepHostUnreachable,
-		socksRepConnectionRefused, socksRepTTLExpired:
-		return true
-	}
-	return false
 }
 
 type upstreamBackoffState struct {
@@ -129,7 +113,9 @@ func replyCodeFromDialError(err error) byte {
 	return socksRepGeneralFailure
 }
 
-// dial tries the upstream SOCKS5 proxy first; on failure, connects directly.
+// dial tries the upstream SOCKS5 proxy first, falling back to a direct
+// connection only when the upstream is unreachable; any other failure is
+// returned to the caller.
 // Canceling ctx unblocks the caller promptly. An in-flight upstream handshake
 // is not torn down on cancel: a cancel proves nothing about the upstream, so
 // the handshake rides out its own deadlines detached (like http.Transport's
@@ -182,14 +168,10 @@ func (p *proxy) dial(ctx context.Context, target socks5Target, creds *socks5Cred
 	}
 	var connectErr upstreamConnectError
 	if errors.As(err, &connectErr) {
-		// Any CONNECT reply proves the greeting succeeded, i.e. the upstream
-		// is alive, so clear any backoff mark whether or not we fall back.
+		// Any CONNECT reply proves the greeting succeeded, i.e. the upstream is
+		// alive: clear backoff and relay its verdict instead of bypassing it.
 		p.backoff.clear(p.upstream)
-		if !connectErr.fallbackEligible(p.fallbackGeneralFailure) {
-			return nil, false, err
-		}
-		log.Printf("upstream CONNECT failed (rep=0x%02x) for %s; falling back to direct", connectErr.rep, target.addr)
-		return dialDirect(ctx, target)
+		return nil, false, err
 	}
 	// errUpstreamAuth and errUpstreamProtocol land here: deliberate
 	// rejections must not be bypassed via a direct fallback.

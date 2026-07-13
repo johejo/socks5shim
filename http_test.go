@@ -278,6 +278,52 @@ func TestHandleHTTPPlainFallsBackToDirect(t *testing.T) {
 	}
 }
 
+func TestHandleHTTPConnectReturns502OnUpstreamConnectFailure(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	target, accepted := startWatchedTarget(t)
+
+	upstreamAddr, serverErr := startScriptedUpstream(t, target, func(conn net.Conn) error {
+		_, err := conn.Write([]byte{socksVersion, socksRepConnectionRefused, socksRSV, socksAtypIPv4, 0, 0, 0, 0, 0, 0})
+		return err
+	})
+
+	client, _ := startHandleHTTPSession(t, newTestProxy(upstreamAddr))
+	fmt.Fprintf(client, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target.addr, target.addr)
+
+	if status := readProxyStatus(t, client); status != http.StatusBadGateway {
+		t.Fatalf("unexpected status: %d, want %d", status, http.StatusBadGateway)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("mock upstream failed: %v", err)
+	}
+
+	assertNoDirectConnection(t, accepted)
+}
+
+func TestHandleHTTPPlainReturns502OnUpstreamConnectFailure(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	target, accepted := startWatchedTarget(t)
+
+	upstreamAddr, serverErr := startScriptedUpstream(t, target, func(conn net.Conn) error {
+		_, err := conn.Write([]byte{socksVersion, socksRepConnectionRefused, socksRSV, socksAtypIPv4, 0, 0, 0, 0, 0, 0})
+		return err
+	})
+
+	client, _ := startHandleHTTPSession(t, newTestProxy(upstreamAddr))
+	fmt.Fprintf(client, "GET http://%s/ HTTP/1.1\r\nHost: %s\r\n\r\n", target.addr, target.addr)
+
+	if status := readProxyStatus(t, client); status != http.StatusBadGateway {
+		t.Fatalf("unexpected status: %d, want %d", status, http.StatusBadGateway)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("mock upstream failed: %v", err)
+	}
+
+	assertNoDirectConnection(t, accepted)
+}
+
 // startHandleHTTPSession serves one in-memory connection with the proxy's
 // HTTP server and returns the client end plus a channel closed when the
 // server tears the connection down (or hands it off via Hijack).

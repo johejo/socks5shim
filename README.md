@@ -2,17 +2,21 @@
 
 `socks5shim` is a small SOCKS5 proxy shim.
 
-It accepts local SOCKS5 client connections, tries an upstream SOCKS5 proxy first, and falls back to a direct TCP connection when the upstream is temporarily unavailable.
+It accepts local SOCKS5 client connections, tries an upstream SOCKS5 proxy first,
+and falls back to a direct TCP connection when the upstream is temporarily unavailable.
 
 ## Features
 
 - SOCKS5 `NO AUTH` method (`0x00`) support.
 - SOCKS5 `CONNECT` command support.
 - IPv4, IPv6, and domain target address support.
-- Upstream-first routing with automatic direct fallback on retryable upstream failures.
+- Upstream-first routing with automatic direct fallback when the upstream is unreachable.
 - Short backoff cache for unavailable upstream endpoints.
 
-A general failure reply (`0x01`) does not fall back by default since some upstreams use it for policy denials; pass `-fallback-on-general-failure` to restore the old always-fallback behavior.
+Fallback to a direct connection happens only when the upstream is unreachable:
+TCP connect refused, or a reset or timeout before it answers.
+Everything else — a `CONNECT` reply (success or failure), an auth rejection,
+a malformed handshake — is surfaced to the client as-is, never routed around.
 
 ## Requirements
 
@@ -44,7 +48,8 @@ socks5shim -h
 go test ./...
 ```
 
-Some tests open loopback listeners and may be skipped in restricted environments. Use `-short` to skip them:
+Some tests open loopback listeners and may be skipped in restricted environments.
+Use `go test -short ./...` to skip them.
 
 ## License
 
