@@ -3,11 +3,9 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log"
 	"net"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -18,10 +16,6 @@ const (
 	directDialTimeout             = 10 * time.Second
 	upstreamUnavailableBackoff    = 3 * time.Second
 )
-
-var errUpstreamUnavailable = errors.New("upstream unavailable")
-var errUpstreamProtocol = errors.New("upstream protocol error")
-var errUpstreamAuth = errors.New("upstream rejected credentials")
 
 // proxy holds the routing configuration and upstream backoff state shared by
 // the SOCKS5 and HTTP handlers.
@@ -38,14 +32,6 @@ func (p *proxy) readTimeout() time.Duration {
 		return defaultClientReadTimeout
 	}
 	return p.clientReadTimeout
-}
-
-type upstreamConnectError struct {
-	rep byte
-}
-
-func (e upstreamConnectError) Error() string {
-	return fmt.Sprintf("upstream CONNECT failed: rep=0x%02x", e.rep)
 }
 
 type upstreamBackoffState struct {
@@ -88,31 +74,6 @@ func (s *upstreamBackoffState) clear(addr string) {
 	delete(s.until, addr)
 }
 
-func replyCodeFromDialError(err error) byte {
-	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
-		return socksRepHostUnreachable
-	}
-
-	var dnsErr *net.DNSError
-	if errors.As(err, &dnsErr) {
-		return socksRepHostUnreachable
-	}
-
-	var errno syscall.Errno
-	if errors.As(err, &errno) {
-		switch errno {
-		case syscall.ECONNREFUSED:
-			return socksRepConnectionRefused
-		case syscall.ENETUNREACH:
-			return socksRepNetworkUnreachable
-		case syscall.EHOSTUNREACH, syscall.ETIMEDOUT:
-			return socksRepHostUnreachable
-		}
-	}
-	return socksRepGeneralFailure
-}
-
 // dial tries the upstream SOCKS5 proxy first, falling back to a direct
 // connection only when the upstream is unreachable; any other failure is
 // returned to the caller.
@@ -135,6 +96,7 @@ func (p *proxy) dial(ctx context.Context, target socks5Target, creds *socks5Cred
 	ch := make(chan upstreamResult, 1)
 	go func() {
 		conn, err := p.dialUpstream(target, creds)
+		p.settleBackoff(err)
 		ch <- upstreamResult{conn, err}
 	}()
 
@@ -144,18 +106,14 @@ func (p *proxy) dial(ctx context.Context, target socks5Target, creds *socks5Cred
 	case r := <-ch:
 		conn, err = r.conn, r.err
 	case <-ctx.Done():
-		// Nobody is waiting for a fallback either; just settle the backoff
-		// cache once the abandoned handshake resolves.
+		// The dial goroutine settles the backoff cache once the abandoned
+		// handshake resolves; nobody is waiting for a fallback either, so
+		// just reap the orphaned conn.
 		go func() {
 			r := <-ch
-			switch {
-			case r.err == nil:
-				p.backoff.clear(p.upstream)
+			if r.conn != nil {
 				r.conn.Close()
-			case errors.As(r.err, new(upstreamConnectError)):
-				p.backoff.clear(p.upstream) // upstream alive; same as attended path below
-			case errors.Is(r.err, errUpstreamUnavailable):
-				p.backoff.markUnavailable(p.upstream, time.Now())
+			} else if errors.Is(r.err, errUpstreamUnavailable) {
 				log.Printf("upstream unavailable: %v (abandoned by canceled request)", r.err)
 			}
 		}()
@@ -163,14 +121,11 @@ func (p *proxy) dial(ctx context.Context, target socks5Target, creds *socks5Cred
 	}
 
 	if err == nil {
-		p.backoff.clear(p.upstream)
 		return conn, true, nil
 	}
-	var connectErr upstreamConnectError
-	if errors.As(err, &connectErr) {
-		// Any CONNECT reply proves the greeting succeeded, i.e. the upstream is
-		// alive: clear backoff and relay its verdict instead of bypassing it.
-		p.backoff.clear(p.upstream)
+	if errors.As(err, new(upstreamConnectError)) {
+		// Any CONNECT reply proves the upstream is alive: relay its verdict
+		// instead of bypassing it.
 		return nil, false, err
 	}
 	// errUpstreamAuth and errUpstreamProtocol land here: deliberate
@@ -179,15 +134,29 @@ func (p *proxy) dial(ctx context.Context, target socks5Target, creds *socks5Cred
 		return nil, false, err
 	}
 
-	// Covers CONNECT reply timeouts too: back off so a wedged upstream
-	// doesn't stall every connection for connectTimeout.
-	p.backoff.markUnavailable(p.upstream, time.Now())
 	log.Printf("upstream unavailable: %v; falling back to direct", err)
 	return dialDirect(ctx, target)
 }
 
+// settleBackoff records dialUpstream's verdict in the backoff cache: any
+// completed handshake (success or a CONNECT reply) proves the upstream alive
+// and clears it; unreachability marks it for the backoff window (covering
+// CONNECT reply timeouts too, so a wedged upstream doesn't stall every
+// connection for connectTimeout); deliberate rejections (auth, protocol)
+// leave it untouched.
+func (p *proxy) settleBackoff(err error) {
+	switch {
+	case err == nil, errors.As(err, new(upstreamConnectError)):
+		p.backoff.clear(p.upstream)
+	case errors.Is(err, errUpstreamUnavailable):
+		p.backoff.markUnavailable(p.upstream, time.Now())
+	}
+}
+
+var directDialer = net.Dialer{Timeout: directDialTimeout}
+
 func dialDirect(ctx context.Context, target socks5Target) (net.Conn, bool, error) {
-	conn, err := (&net.Dialer{Timeout: directDialTimeout}).DialContext(ctx, "tcp", target.addr)
+	conn, err := directDialer.DialContext(ctx, "tcp", target.addr)
 	if err != nil {
 		return nil, false, err
 	}

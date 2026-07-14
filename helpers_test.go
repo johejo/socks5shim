@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"syscall"
 	"testing"
@@ -45,12 +46,8 @@ func performUpstreamNoAuthHandshake(conn net.Conn, target socks5Target) error {
 // wantUser/wantPass, and accepts it.
 func performUpstreamUserPassHandshake(wantUser, wantPass string) func(net.Conn, socks5Target) error {
 	return func(conn net.Conn, target socks5Target) error {
-		greeting := make([]byte, socksGreetingHeaderLen+2)
-		if _, err := io.ReadFull(conn, greeting); err != nil {
+		if err := expectGreetingWithUserPass(conn); err != nil {
 			return err
-		}
-		if !bytes.Equal(greeting, []byte{socksVersion, 0x02, socksMethodNoAuth, socksMethodUserPass}) {
-			return fmt.Errorf("unexpected upstream greeting: %x", greeting)
 		}
 		if _, err := conn.Write([]byte{socksVersion, socksMethodUserPass}); err != nil {
 			return err
@@ -68,6 +65,44 @@ func performUpstreamUserPassHandshake(wantUser, wantPass string) func(net.Conn, 
 		}
 		return expectConnectRequest(conn, target)
 	}
+}
+
+// expectGreetingWithUserPass reads a 4-byte upstream greeting and checks it
+// offers exactly no-auth plus username/password.
+func expectGreetingWithUserPass(conn net.Conn) error {
+	greeting := make([]byte, socksGreetingHeaderLen+2)
+	if _, err := io.ReadFull(conn, greeting); err != nil {
+		return err
+	}
+	if !bytes.Equal(greeting, []byte{socksVersion, 0x02, socksMethodNoAuth, socksMethodUserPass}) {
+		return fmt.Errorf("unexpected upstream greeting: %x", greeting)
+	}
+	return nil
+}
+
+// userPassHandshakeReplying returns an upstream handshake that selects the
+// username/password method, reads the RFC 1929 subnegotiation, and answers
+// it with reply (a reply that just returns closes the connection).
+func userPassHandshakeReplying(reply func(net.Conn) error) func(net.Conn, socks5Target) error {
+	return func(conn net.Conn, _ socks5Target) error {
+		if err := expectGreetingWithUserPass(conn); err != nil {
+			return err
+		}
+		if _, err := conn.Write([]byte{socksVersion, socksMethodUserPass}); err != nil {
+			return err
+		}
+		if _, err := readUserPassAuth(conn); err != nil {
+			return err
+		}
+		return reply(conn)
+	}
+}
+
+// rejectUserPassAuth answers an RFC 1929 subnegotiation with a non-zero
+// STATUS byte.
+func rejectUserPassAuth(conn net.Conn) error {
+	_, err := conn.Write([]byte{socksUserPassVersion, 0x01})
+	return err
 }
 
 func expectConnectRequest(conn net.Conn, target socks5Target) error {
@@ -206,6 +241,27 @@ func assertNoDirectConnection(t *testing.T, accepted chan struct{}) {
 	case <-accepted:
 		t.Fatal("direct fallback occurred unexpectedly")
 	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+// deadUpstreamAddr reserves a loopback port and closes the listener, giving
+// an upstream address that refuses connections.
+func deadUpstreamAddr(t *testing.T) string {
+	t.Helper()
+	ln := mustListenLoopback(t, "dead-upstream")
+	addr := ln.Addr().String()
+	ln.Close()
+	return addr
+}
+
+// testTargetRefused is a fixed loopback target that refuses connections, for
+// tests where the target must never be reached or any dial must fail fast.
+func testTargetRefused() socks5Target {
+	return socks5Target{
+		atyp: socksAtypIPv4,
+		ip:   netip.MustParseAddr("127.0.0.1"),
+		port: 1,
+		addr: "127.0.0.1:1",
 	}
 }
 

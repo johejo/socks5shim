@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/netip"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -24,11 +22,8 @@ func TestDialDoesNotFallbackOnUpstreamAuthRejection(t *testing.T) {
 		reply func(conn net.Conn) error // response to the RFC 1929 subnegotiation
 	}{
 		{
-			name: "status byte rejection",
-			reply: func(conn net.Conn) error {
-				_, err := conn.Write([]byte{socksUserPassVersion, 0x01})
-				return err
-			},
+			name:  "status byte rejection",
+			reply: rejectUserPassAuth,
 		},
 		{
 			name:  "close without status byte",
@@ -37,30 +32,10 @@ func TestDialDoesNotFallbackOnUpstreamAuthRejection(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			targetLn := mustListenLoopback(t, "target")
-			target := targetFromListener(t, targetLn)
-			accepted := make(chan struct{}, 1)
-			go func() {
-				conn, err := targetLn.Accept()
-				if err == nil {
-					conn.Close()
-					accepted <- struct{}{}
-				}
-			}()
+			target, accepted := startWatchedTarget(t)
 
-			handshake := func(conn net.Conn, target socks5Target) error {
-				if readGreetingWithUserPass(conn) == nil {
-					return fmt.Errorf("unexpected upstream greeting")
-				}
-				if _, err := conn.Write([]byte{socksVersion, socksMethodUserPass}); err != nil {
-					return err
-				}
-				if _, err := readUserPassAuth(conn); err != nil {
-					return err
-				}
-				return tt.reply(conn)
-			}
-			upstreamAddr, serverErr := startScriptedUpstreamHandshake(t, target, handshake, func(net.Conn) error { return nil })
+			upstreamAddr, serverErr := startScriptedUpstreamHandshake(t, target,
+				userPassHandshakeReplying(tt.reply), func(net.Conn) error { return nil })
 
 			p := newTestProxy(upstreamAddr)
 			conn, viaUpstream, err := p.dial(context.Background(), target, &socks5Creds{username: "user", password: "wrong"})
@@ -80,11 +55,7 @@ func TestDialDoesNotFallbackOnUpstreamAuthRejection(t *testing.T) {
 			if err := <-serverErr; err != nil {
 				t.Fatalf("mock upstream failed: %v", err)
 			}
-			select {
-			case <-accepted:
-				t.Fatal("direct fallback occurred despite auth rejection")
-			case <-time.After(150 * time.Millisecond):
-			}
+			assertNoDirectConnection(t, accepted)
 		})
 	}
 }
@@ -263,11 +234,7 @@ func TestDialCanceledDuringUpstreamHandshake(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	select {
-	case <-fx.accepted:
-		t.Fatal("direct fallback occurred despite cancellation")
-	case <-time.After(150 * time.Millisecond):
-	}
+	assertNoDirectConnection(t, fx.accepted)
 }
 
 // TestDialCanceledDuringAuthDoesNotMarkBackoff pins the fail-closed side of
@@ -276,36 +243,17 @@ func TestDialCanceledDuringUpstreamHandshake(t *testing.T) {
 func TestDialCanceledDuringAuthDoesNotMarkBackoff(t *testing.T) {
 	skipIfShortNetwork(t)
 
-	targetLn := mustListenLoopback(t, "target")
-	target := targetFromListener(t, targetLn)
-	accepted := make(chan struct{}, 1)
-	go func() {
-		conn, err := targetLn.Accept()
-		if err == nil {
-			conn.Close()
-			accepted <- struct{}{}
-		}
-	}()
+	target, accepted := startWatchedTarget(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	// Select user/pass, read the subnegotiation, then cancel and stall: the
 	// abandoned dial times out inside authUpstream, an errUpstreamAuth path.
-	handshake := func(conn net.Conn, target socks5Target) error {
-		greeting := make([]byte, socksGreetingHeaderLen+2)
-		if _, err := io.ReadFull(conn, greeting); err != nil {
-			return err
-		}
-		if _, err := conn.Write([]byte{socksVersion, socksMethodUserPass}); err != nil {
-			return err
-		}
-		if _, err := readUserPassAuth(conn); err != nil {
-			return err
-		}
+	handshake := userPassHandshakeReplying(func(conn net.Conn) error {
 		cancel()
 		io.Copy(io.Discard, conn)
 		return nil
-	}
+	})
 	upstreamAddr, serverErr := startScriptedUpstreamHandshake(t, target, handshake, func(net.Conn) error { return nil })
 
 	p := newTestProxy(upstreamAddr)
@@ -330,11 +278,7 @@ func TestDialCanceledDuringAuthDoesNotMarkBackoff(t *testing.T) {
 	if p.backoff.shouldSkip(p.upstream, time.Now()) {
 		t.Fatal("auth-stage failure of an abandoned dial must not mark backoff")
 	}
-	select {
-	case <-accepted:
-		t.Fatal("direct fallback occurred despite cancellation")
-	case <-time.After(150 * time.Millisecond):
-	}
+	assertNoDirectConnection(t, accepted)
 }
 
 func TestDialPreCanceledContext(t *testing.T) {
@@ -344,13 +288,7 @@ func TestDialPreCanceledContext(t *testing.T) {
 	// absent past that window proves no dial was attempted at all.
 	p := newTestProxy("127.0.0.1:1")
 	p.dialTimeout = 100 * time.Millisecond
-
-	target := socks5Target{
-		atyp: socksAtypIPv4,
-		ip:   netip.MustParseAddr("127.0.0.1"),
-		port: 1,
-		addr: "127.0.0.1:1",
-	}
+	target := testTargetRefused()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -445,38 +383,8 @@ func TestDialMarksUnavailableBackoff(t *testing.T) {
 	p := newTestProxy("127.0.0.1:1")
 	p.dialTimeout = 100 * time.Millisecond
 
-	target := socks5Target{
-		atyp: socksAtypIPv4,
-		ip:   netip.MustParseAddr("127.0.0.1"),
-		port: 1,
-		addr: "127.0.0.1:1",
-	}
-
-	_, _, _ = p.dial(context.Background(), target, nil)
+	_, _, _ = p.dial(context.Background(), testTargetRefused(), nil)
 	if !p.backoff.shouldSkip(p.upstream, time.Now()) {
 		t.Fatal("expected upstream backoff cache to be marked unavailable")
-	}
-}
-
-func TestReplyCodeFromDialError(t *testing.T) {
-	tests := []struct {
-		name string
-		err  error
-		want byte
-	}{
-		{name: "refused", err: syscall.ECONNREFUSED, want: socksRepConnectionRefused},
-		{name: "network unreachable", err: syscall.ENETUNREACH, want: socksRepNetworkUnreachable},
-		{name: "host unreachable", err: syscall.EHOSTUNREACH, want: socksRepHostUnreachable},
-		{name: "timeout errno", err: syscall.ETIMEDOUT, want: socksRepHostUnreachable},
-		{name: "dns error", err: &net.DNSError{Err: "no such host", Name: "x.invalid"}, want: socksRepHostUnreachable},
-		{name: "fallback", err: errors.New("other"), want: socksRepGeneralFailure},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := replyCodeFromDialError(tt.err); got != tt.want {
-				t.Fatalf("replyCodeFromDialError(%v) = 0x%02x, want 0x%02x", tt.err, got, tt.want)
-			}
-		})
 	}
 }

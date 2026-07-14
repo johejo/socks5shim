@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"net/netip"
 	"strconv"
 	"time"
 )
@@ -37,7 +36,21 @@ func (p *proxy) newHTTPServer() *http.Server {
 		},
 	}
 	return &http.Server{
-		Handler:           p.httpHandler(rp),
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodConnect {
+				p.serveConnect(w, r)
+				return
+			}
+			// Only absolute-form http targets are accepted, as a proxy
+			// should. Anything else — origin-form, https, an h2c preface —
+			// would make the Transport originate the connection itself
+			// (even TLS) rather than forward the client's request.
+			if r.URL.Scheme != "http" || r.URL.Host == "" {
+				http.Error(w, "proxy requires an absolute-form http URL", http.StatusBadRequest)
+				return
+			}
+			rp.ServeHTTP(w, r)
+		}),
 		ReadHeaderTimeout: p.readTimeout(),
 		IdleTimeout:       2 * time.Minute,
 		// ReadTimeout and WriteTimeout stay zero: hijacked CONNECT
@@ -45,32 +58,13 @@ func (p *proxy) newHTTPServer() *http.Server {
 	}
 }
 
-func (p *proxy) httpHandler(rp *httputil.ReverseProxy) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "CONNECT" {
-			p.serveConnect(w, r)
-			return
-		}
-		// Only absolute-form http targets are accepted, as a proxy
-		// should. Anything else — origin-form, https, an h2c preface —
-		// would make the Transport originate the connection itself
-		// (even TLS) rather than forward the client's request.
-		if r.URL.Scheme != "http" || r.URL.Host == "" {
-			http.Error(w, "proxy requires an absolute-form http URL", http.StatusBadRequest)
-			return
-		}
-		rp.ServeHTTP(w, r)
-	})
-}
-
 func (p *proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
-	host, port, err := parseHostPort(r.Host, "443")
+	target, err := parseTarget(r.Host, "443")
 	if err != nil {
 		http.Error(w, "bad CONNECT target", http.StatusBadRequest)
 		return
 	}
 
-	target := buildHTTPTarget(host, port)
 	remote, viaUpstream, err := p.dial(r.Context(), target, nil)
 	if err != nil {
 		log.Printf("HTTP CONNECT FAIL %s: %v", target.addr, err)
@@ -107,11 +101,10 @@ func (p *proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 // dialContext adapts the SOCKS5-or-direct dial path to http.Transport. The
 // request ctx is honored; see dial for its cancellation behavior.
 func (p *proxy) dialContext(ctx context.Context, _, addr string) (net.Conn, error) {
-	host, port, err := parseHostPort(addr, "80")
+	target, err := parseTarget(addr, "80")
 	if err != nil {
 		return nil, err
 	}
-	target := buildHTTPTarget(host, port)
 	remote, viaUpstream, err := p.dial(ctx, target, nil)
 	if err != nil {
 		return nil, err
@@ -124,39 +117,18 @@ func (p *proxy) dialContext(ctx context.Context, _, addr string) (net.Conn, erro
 	return remote, nil
 }
 
-func parseHostPort(hostport, defaultPort string) (string, uint16, error) {
+// parseTarget parses an HTTP proxy destination (a CONNECT authority-form
+// target or a URL host) into a socks5Target, defaulting the port when absent.
+func parseTarget(hostport, defaultPort string) (socks5Target, error) {
 	host, portStr, err := net.SplitHostPort(hostport)
 	if err != nil {
 		// No port specified; treat whole string as host.
 		host = hostport
 		portStr = defaultPort
 	}
-	// buildConnectRequest encodes the domain length as a single byte;
-	// byte(len) silently truncates mod 256, so reject oversized hosts here.
-	if host == "" || len(host) > 255 {
-		return "", 0, fmt.Errorf("invalid host length: %d", len(host))
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		return socks5Target{}, fmt.Errorf("invalid port: %s", portStr)
 	}
-	p, err := strconv.Atoi(portStr)
-	if err != nil || p <= 0 || p > 65535 {
-		return "", 0, fmt.Errorf("invalid port: %s", portStr)
-	}
-	return host, uint16(p), nil
-}
-
-func buildHTTPTarget(host string, port uint16) socks5Target {
-	t := socks5Target{port: port}
-	if ip, err := netip.ParseAddr(host); err == nil {
-		if ip.Is4() {
-			t.atyp = socksAtypIPv4
-		} else {
-			t.atyp = socksAtypIPv6
-		}
-		t.ip = ip
-		t.addr = netip.AddrPortFrom(ip, port).String()
-	} else {
-		t.atyp = socksAtypDomain
-		t.domain = host
-		t.addr = net.JoinHostPort(host, strconv.Itoa(int(port)))
-	}
-	return t
+	return targetFromHostPort(host, uint16(port))
 }

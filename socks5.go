@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"slices"
 	"strconv"
+	"syscall"
 	"time"
 )
 
@@ -247,6 +248,48 @@ func readTarget(r io.Reader, atyp byte) (socks5Target, error) {
 	return t, nil
 }
 
+// targetFromHostPort builds a socks5Target from a pre-split host and port,
+// deriving atyp and addr the same way readTarget does for wire targets.
+// Domains longer than 255 bytes are rejected here because
+// buildConnectRequest encodes the length as a single byte, and byte(len)
+// would silently truncate.
+func targetFromHostPort(host string, port uint16) (socks5Target, error) {
+	t := socks5Target{port: port}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if ip.Is4() {
+			t.atyp = socksAtypIPv4
+		} else {
+			t.atyp = socksAtypIPv6
+		}
+		t.ip = ip
+		t.addr = netip.AddrPortFrom(ip, port).String()
+		return t, nil
+	}
+	if host == "" || len(host) > 255 {
+		return t, fmt.Errorf("invalid host length: %d", len(host))
+	}
+	t.atyp = socksAtypDomain
+	t.domain = host
+	t.addr = net.JoinHostPort(host, strconv.Itoa(int(port)))
+	return t, nil
+}
+
+// Upstream dial failure classes, consumed by dial's routing policy (see
+// settleBackoff): only errUpstreamUnavailable may trigger a direct fallback.
+var errUpstreamUnavailable = errors.New("upstream unavailable")
+var errUpstreamProtocol = errors.New("upstream protocol error")
+var errUpstreamAuth = errors.New("upstream rejected credentials")
+
+// upstreamConnectError carries a CONNECT failure reply from the upstream, to
+// be relayed to the client verbatim.
+type upstreamConnectError struct {
+	rep byte
+}
+
+func (e upstreamConnectError) Error() string {
+	return fmt.Sprintf("upstream CONNECT failed: rep=0x%02x", e.rep)
+}
+
 // dialUpstream performs a full SOCKS5 handshake with the upstream proxy.
 // p.dialTimeout covers TCP connect + greeting; p.connectTimeout covers the
 // CONNECT request/reply (includes the upstream-side dial to the target).
@@ -276,9 +319,11 @@ func (p *proxy) dialUpstream(target socks5Target, creds *socks5Creds) (net.Conn,
 
 	// Greeting: offer username/password too when the client supplied
 	// credentials to pass through.
-	greeting := []byte{socksVersion, 0x01, socksMethodNoAuth}
+	var greeting []byte
 	if creds != nil {
 		greeting = []byte{socksVersion, 0x02, socksMethodNoAuth, socksMethodUserPass}
+	} else {
+		greeting = []byte{socksVersion, 0x01, socksMethodNoAuth}
 	}
 	if _, err := conn.Write(greeting); err != nil {
 		return nil, fmt.Errorf("%w: %v", errUpstreamUnavailable, err)
@@ -360,7 +405,8 @@ func authUpstream(conn net.Conn, creds *socks5Creds) error {
 }
 
 func buildUserPassRequest(c *socks5Creds) []byte {
-	buf := []byte{socksUserPassVersion, byte(len(c.username))}
+	buf := make([]byte, 0, 3+len(c.username)+len(c.password))
+	buf = append(buf, socksUserPassVersion, byte(len(c.username)))
 	buf = append(buf, c.username...)
 	buf = append(buf, byte(len(c.password)))
 	return append(buf, c.password...)
@@ -405,6 +451,33 @@ func discardN(r io.Reader, n int) error {
 	}
 	_, err := io.CopyN(io.Discard, r, int64(n))
 	return err
+}
+
+// replyCodeFromDialError maps a direct-dial failure to the SOCKS5 reply code
+// sent back to the client.
+func replyCodeFromDialError(err error) byte {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return socksRepHostUnreachable
+	}
+
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return socksRepHostUnreachable
+	}
+
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch errno {
+		case syscall.ECONNREFUSED:
+			return socksRepConnectionRefused
+		case syscall.ENETUNREACH:
+			return socksRepNetworkUnreachable
+		case syscall.EHOSTUNREACH, syscall.ETIMEDOUT:
+			return socksRepHostUnreachable
+		}
+	}
+	return socksRepGeneralFailure
 }
 
 func sendReply(w io.Writer, rep byte) {

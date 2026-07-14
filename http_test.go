@@ -87,7 +87,7 @@ func TestHandleHTTPConnectClientDisconnectUnblocksHandler(t *testing.T) {
 func TestHandleHTTPPlainGET(t *testing.T) {
 	skipIfShortNetwork(t)
 
-	targetAddr := startHeaderEchoTarget(t, func(req *http.Request) string {
+	targetAddr := startKeepAliveTarget(t, func(req *http.Request) string {
 		if req.URL.Path != "/test" {
 			return "unexpected path: " + req.URL.Path
 		}
@@ -254,7 +254,7 @@ func TestHandleHTTPConnectFallsBackToDirect(t *testing.T) {
 func TestHandleHTTPPlainFallsBackToDirect(t *testing.T) {
 	skipIfShortNetwork(t)
 
-	targetAddr := startHeaderEchoTarget(t, func(*http.Request) string { return "OK" })
+	targetAddr := startKeepAliveTarget(t, func(*http.Request) string { return "OK" })
 
 	client := dialHTTPProxyWithDeadUpstream(t)
 
@@ -278,50 +278,38 @@ func TestHandleHTTPPlainFallsBackToDirect(t *testing.T) {
 	}
 }
 
-func TestHandleHTTPConnectReturns502OnUpstreamConnectFailure(t *testing.T) {
+func TestHandleHTTPReturns502OnUpstreamConnectFailure(t *testing.T) {
 	skipIfShortNetwork(t)
 
-	target, accepted := startWatchedTarget(t)
-
-	upstreamAddr, serverErr := startScriptedUpstream(t, target, func(conn net.Conn) error {
-		_, err := conn.Write([]byte{socksVersion, socksRepConnectionRefused, socksRSV, socksAtypIPv4, 0, 0, 0, 0, 0, 0})
-		return err
-	})
-
-	client, _ := startHandleHTTPSession(t, newTestProxy(upstreamAddr))
-	fmt.Fprintf(client, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target.addr, target.addr)
-
-	if status := readProxyStatus(t, client); status != http.StatusBadGateway {
-		t.Fatalf("unexpected status: %d, want %d", status, http.StatusBadGateway)
+	tests := []struct {
+		name          string
+		requestFormat string // takes the target host:port twice
+	}{
+		{name: "connect", requestFormat: "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n"},
+		{name: "plain", requestFormat: "GET http://%s/ HTTP/1.1\r\nHost: %s\r\n\r\n"},
 	}
-	if err := <-serverErr; err != nil {
-		t.Fatalf("mock upstream failed: %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			target, accepted := startWatchedTarget(t)
+
+			upstreamAddr, serverErr := startScriptedUpstream(t, target, func(conn net.Conn) error {
+				_, err := conn.Write([]byte{socksVersion, socksRepConnectionRefused, socksRSV, socksAtypIPv4, 0, 0, 0, 0, 0, 0})
+				return err
+			})
+
+			client, _ := startHandleHTTPSession(t, newTestProxy(upstreamAddr))
+			fmt.Fprintf(client, tt.requestFormat, target.addr, target.addr)
+
+			if status := readProxyStatus(t, client); status != http.StatusBadGateway {
+				t.Fatalf("unexpected status: %d, want %d", status, http.StatusBadGateway)
+			}
+			if err := <-serverErr; err != nil {
+				t.Fatalf("mock upstream failed: %v", err)
+			}
+
+			assertNoDirectConnection(t, accepted)
+		})
 	}
-
-	assertNoDirectConnection(t, accepted)
-}
-
-func TestHandleHTTPPlainReturns502OnUpstreamConnectFailure(t *testing.T) {
-	skipIfShortNetwork(t)
-
-	target, accepted := startWatchedTarget(t)
-
-	upstreamAddr, serverErr := startScriptedUpstream(t, target, func(conn net.Conn) error {
-		_, err := conn.Write([]byte{socksVersion, socksRepConnectionRefused, socksRSV, socksAtypIPv4, 0, 0, 0, 0, 0, 0})
-		return err
-	})
-
-	client, _ := startHandleHTTPSession(t, newTestProxy(upstreamAddr))
-	fmt.Fprintf(client, "GET http://%s/ HTTP/1.1\r\nHost: %s\r\n\r\n", target.addr, target.addr)
-
-	if status := readProxyStatus(t, client); status != http.StatusBadGateway {
-		t.Fatalf("unexpected status: %d, want %d", status, http.StatusBadGateway)
-	}
-	if err := <-serverErr; err != nil {
-		t.Fatalf("mock upstream failed: %v", err)
-	}
-
-	assertNoDirectConnection(t, accepted)
 }
 
 // startHandleHTTPSession serves one in-memory connection with the proxy's
@@ -391,11 +379,7 @@ func (l *oneShotListener) Addr() net.Addr { return l.addr }
 func dialHTTPProxyWithDeadUpstream(t *testing.T) net.Conn {
 	t.Helper()
 
-	deadLn := mustListenLoopback(t, "dead-upstream")
-	deadAddr := deadLn.Addr().String()
-	deadLn.Close()
-
-	client, _ := startHandleHTTPSession(t, newTestProxy(deadAddr))
+	client, _ := startHandleHTTPSession(t, newTestProxy(deadUpstreamAddr(t)))
 	return client
 }
 
@@ -441,31 +425,6 @@ func startKeepAliveTarget(t *testing.T, respond func(*http.Request) string) stri
 						return
 					}
 				}
-			}(conn)
-		}
-	}()
-	return ln.Addr().String()
-}
-
-// startHeaderEchoTarget starts an HTTP target that answers each request
-// with a body built by describe, and returns its address.
-func startHeaderEchoTarget(t *testing.T, describe func(*http.Request) string) string {
-	t.Helper()
-	ln := mustListenLoopback(t, "target")
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				req, err := http.ReadRequest(bufio.NewReader(c))
-				if err != nil {
-					return
-				}
-				body := describe(req)
-				fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
 			}(conn)
 		}
 	}()

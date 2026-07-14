@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -404,9 +405,8 @@ func TestDialUpstreamWithCredsUpstreamPicksNoAuth(t *testing.T) {
 
 	target := testTarget443()
 	handshake := func(conn net.Conn, target socks5Target) error {
-		greeting := readGreetingWithUserPass(conn)
-		if greeting == nil {
-			return fmt.Errorf("unexpected upstream greeting")
+		if err := expectGreetingWithUserPass(conn); err != nil {
+			return err
 		}
 		// Upstream may pick no-auth even when credentials were offered; the
 		// subnegotiation must be skipped.
@@ -434,20 +434,8 @@ func TestDialUpstreamAuthRejected(t *testing.T) {
 	skipIfShortNetwork(t)
 
 	target := testTarget443()
-	handshake := func(conn net.Conn, target socks5Target) error {
-		if readGreetingWithUserPass(conn) == nil {
-			return fmt.Errorf("unexpected upstream greeting")
-		}
-		if _, err := conn.Write([]byte{socksVersion, socksMethodUserPass}); err != nil {
-			return err
-		}
-		if _, err := readUserPassAuth(conn); err != nil {
-			return err
-		}
-		_, err := conn.Write([]byte{socksUserPassVersion, 0x01}) // reject
-		return err
-	}
-	upstreamAddr, serverErr := startScriptedUpstreamHandshake(t, target, handshake, func(net.Conn) error { return nil })
+	upstreamAddr, serverErr := startScriptedUpstreamHandshake(t, target,
+		userPassHandshakeReplying(rejectUserPassAuth), func(net.Conn) error { return nil })
 
 	_, err := newTestProxy(upstreamAddr).dialUpstream(target, &socks5Creds{username: "user", password: "wrong"})
 	if !errors.Is(err, errUpstreamAuth) {
@@ -463,8 +451,8 @@ func TestDialUpstreamWithCredsMethodNoAcceptable(t *testing.T) {
 
 	target := testTarget443()
 	handshake := func(conn net.Conn, target socks5Target) error {
-		if readGreetingWithUserPass(conn) == nil {
-			return fmt.Errorf("unexpected upstream greeting")
+		if err := expectGreetingWithUserPass(conn); err != nil {
+			return err
 		}
 		_, err := conn.Write([]byte{socksVersion, socksMethodNoAcceptable})
 		return err
@@ -510,19 +498,10 @@ func TestDialUpstreamBadAuthReplyVersion(t *testing.T) {
 	skipIfShortNetwork(t)
 
 	target := testTarget443()
-	handshake := func(conn net.Conn, target socks5Target) error {
-		if readGreetingWithUserPass(conn) == nil {
-			return fmt.Errorf("unexpected upstream greeting")
-		}
-		if _, err := conn.Write([]byte{socksVersion, socksMethodUserPass}); err != nil {
-			return err
-		}
-		if _, err := readUserPassAuth(conn); err != nil {
-			return err
-		}
+	handshake := userPassHandshakeReplying(func(conn net.Conn) error {
 		_, err := conn.Write([]byte{0x05, socksUserPassSuccess}) // wrong subneg version
 		return err
-	}
+	})
 	upstreamAddr, serverErr := startScriptedUpstreamHandshake(t, target, handshake, func(net.Conn) error { return nil })
 
 	_, err := newTestProxy(upstreamAddr).dialUpstream(target, &socks5Creds{username: "user", password: "pass"})
@@ -532,19 +511,6 @@ func TestDialUpstreamBadAuthReplyVersion(t *testing.T) {
 	if err := <-serverErr; err != nil {
 		t.Fatalf("mock upstream failed: %v", err)
 	}
-}
-
-// readGreetingWithUserPass reads a 4-byte greeting and returns it if it is
-// exactly {05,02,00,02} (no-auth plus username/password offered), else nil.
-func readGreetingWithUserPass(conn net.Conn) []byte {
-	greeting := make([]byte, socksGreetingHeaderLen+2)
-	if _, err := io.ReadFull(conn, greeting); err != nil {
-		return nil
-	}
-	if !bytes.Equal(greeting, []byte{socksVersion, 0x02, socksMethodNoAuth, socksMethodUserPass}) {
-		return nil
-	}
-	return greeting
 }
 
 func TestHandleSuccessfulConnectAndRelayViaUpstream(t *testing.T) {
@@ -655,20 +621,8 @@ func TestHandleReturnsGeneralFailureWhenUpstreamRejectsAuth(t *testing.T) {
 	// A reachable target proves whether a (forbidden) direct fallback happened.
 	target, accepted := startWatchedTarget(t)
 
-	handshake := func(conn net.Conn, target socks5Target) error {
-		if readGreetingWithUserPass(conn) == nil {
-			return fmt.Errorf("unexpected upstream greeting")
-		}
-		if _, err := conn.Write([]byte{socksVersion, socksMethodUserPass}); err != nil {
-			return err
-		}
-		if _, err := readUserPassAuth(conn); err != nil {
-			return err
-		}
-		_, err := conn.Write([]byte{socksUserPassVersion, 0x01}) // reject
-		return err
-	}
-	upstreamAddr, serverErr := startScriptedUpstreamHandshake(t, target, handshake, func(net.Conn) error { return nil })
+	upstreamAddr, serverErr := startScriptedUpstreamHandshake(t, target,
+		userPassHandshakeReplying(rejectUserPassAuth), func(net.Conn) error { return nil })
 
 	client, _ := startHandleSession(t, newTestProxy(upstreamAddr))
 	performClientUserPassHandshake(t, client, "user", "wrong")
@@ -708,11 +662,7 @@ func TestHandleFallsBackToDirectWhenUpstreamUnavailable(t *testing.T) {
 	}()
 	target := targetFromListener(t, targetLn)
 
-	deadLn := mustListenLoopback(t, "dead-upstream")
-	deadAddr := deadLn.Addr().String()
-	deadLn.Close()
-
-	client, _ := startHandleSession(t, newTestProxy(deadAddr))
+	client, _ := startHandleSession(t, newTestProxy(deadUpstreamAddr(t)))
 	performClientNoAuthHandshake(t, client)
 
 	if _, err := client.Write(buildConnectRequest(target)); err != nil {
@@ -762,6 +712,29 @@ func TestHandleReturnsUpstreamRepToClient(t *testing.T) {
 			}
 
 			assertNoDirectConnection(t, accepted)
+		})
+	}
+}
+
+func TestReplyCodeFromDialError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want byte
+	}{
+		{name: "refused", err: syscall.ECONNREFUSED, want: socksRepConnectionRefused},
+		{name: "network unreachable", err: syscall.ENETUNREACH, want: socksRepNetworkUnreachable},
+		{name: "host unreachable", err: syscall.EHOSTUNREACH, want: socksRepHostUnreachable},
+		{name: "timeout errno", err: syscall.ETIMEDOUT, want: socksRepHostUnreachable},
+		{name: "dns error", err: &net.DNSError{Err: "no such host", Name: "x.invalid"}, want: socksRepHostUnreachable},
+		{name: "fallback", err: errors.New("other"), want: socksRepGeneralFailure},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := replyCodeFromDialError(tt.err); got != tt.want {
+				t.Fatalf("replyCodeFromDialError(%v) = 0x%02x, want 0x%02x", tt.err, got, tt.want)
+			}
 		})
 	}
 }
