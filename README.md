@@ -18,6 +18,13 @@ TCP connect refused, or a reset or timeout before it answers.
 Everything else — a `CONNECT` reply (success or failure), an auth rejection,
 a malformed handshake — is surfaced to the client as-is, never routed around.
 
+The one opt-in exception is `-fallback-on-general-failure`: it also falls back
+when the upstream answers `CONNECT` with a general failure (`0x01`), for
+upstreams that use `0x01` for transient internal errors. It is off by default
+because some upstreams use `0x01` for policy denials, which the fallback would
+let clients bypass via the direct path. All other reply codes are still
+relayed as-is.
+
 ## Requirements
 
 - Go

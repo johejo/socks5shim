@@ -312,6 +312,36 @@ func TestHandleHTTPReturns502OnUpstreamConnectFailure(t *testing.T) {
 	}
 }
 
+// The opt-in 0x01 fallback reaches the HTTP handlers through the shared dial:
+// an upstream 0x01 reply routes direct instead of answering 502.
+func TestHandleHTTPConnectFallsBackOnGeneralFailureWhenOptedIn(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	target, accepted := startWatchedTarget(t)
+
+	upstreamAddr, serverErr := startScriptedUpstream(t, target, func(conn net.Conn) error {
+		_, err := conn.Write([]byte{socksVersion, socksRepGeneralFailure, socksRSV, socksAtypIPv4, 0, 0, 0, 0, 0, 0})
+		return err
+	})
+
+	p := newTestProxy(upstreamAddr)
+	p.fallbackGeneralFailure = true
+	client, _ := startHandleHTTPSession(t, p)
+	fmt.Fprintf(client, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target.addr, target.addr)
+
+	if status := readProxyStatus(t, client); status != http.StatusOK {
+		t.Fatalf("unexpected status: %d, want %d", status, http.StatusOK)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("mock upstream failed: %v", err)
+	}
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("target was not dialed directly")
+	}
+}
+
 // startHandleHTTPSession serves one in-memory connection with the proxy's
 // HTTP server and returns the client end plus a channel closed when the
 // server tears the connection down (or hands it off via Hijack).

@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -61,29 +60,51 @@ func TestDialDoesNotFallbackOnUpstreamAuthRejection(t *testing.T) {
 }
 
 // Every CONNECT failure reply, defined (0x01-0x08) or undefined (0x09), is
-// relayed to the caller verbatim, never bypassed via a direct fallback.
+// relayed to the caller verbatim, never bypassed via a direct fallback. The
+// opt-in cases pin that the 0x01 fallback (covered by
+// TestDialFallsBackOnGeneralFailureWhenOptedIn) does not widen to other codes.
 func TestDialDoesNotFallbackOnUpstreamConnectFailure(t *testing.T) {
 	skipIfShortNetwork(t)
 
-	reps := []byte{
-		socksRepGeneralFailure,      // 0x01
-		0x02,                        // policy denial
-		socksRepNetworkUnreachable,  // 0x03
-		socksRepHostUnreachable,     // 0x04
-		socksRepConnectionRefused,   // 0x05
-		socksRepTTLExpired,          // 0x06
-		socksRepCommandNotSupported, // 0x07
-		socksRepAddressTypeNotSupp,  // 0x08
-		0x09,                        // undefined
+	tests := []struct {
+		name                   string
+		rep                    byte
+		fallbackGeneralFailure bool
+	}{
+		{name: "general failure", rep: socksRepGeneralFailure},
+		{name: "policy denial", rep: 0x02},
+		{name: "policy denial with opt-in", rep: 0x02, fallbackGeneralFailure: true},
+		{name: "network unreachable", rep: socksRepNetworkUnreachable},
+		{name: "host unreachable", rep: socksRepHostUnreachable},
+		{name: "connection refused", rep: socksRepConnectionRefused},
+		{name: "ttl expired", rep: socksRepTTLExpired},
+		{name: "command not supported", rep: socksRepCommandNotSupported},
+		{name: "address type not supported", rep: socksRepAddressTypeNotSupp},
+		{name: "undefined 0x09", rep: 0x09},
+		{name: "undefined 0x09 with opt-in", rep: 0x09, fallbackGeneralFailure: true},
 	}
-	for _, rep := range reps {
-		t.Run(fmt.Sprintf("rep_0x%02x", rep), func(t *testing.T) {
-			fx := startDialFallbackFixture(t, []byte{socksVersion, rep, socksRSV, socksAtypIPv4})
-			fx.assertNoFallback(t, rep)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fx := startDialFallbackFixture(t, []byte{socksVersion, tt.rep, socksRSV, socksAtypIPv4})
+			fx.p.fallbackGeneralFailure = tt.fallbackGeneralFailure
+			fx.assertNoFallback(t, tt.rep)
 			if fx.p.backoff.shouldSkip(fx.p.upstream, time.Now()) {
 				t.Fatal("backoff cache must not be marked on CONNECT rep failure")
 			}
 		})
+	}
+}
+
+// With the opt-in flag set, a 0x01 reply falls back to direct. The reply
+// still proves the upstream alive, so the backoff cache stays clear.
+func TestDialFallsBackOnGeneralFailureWhenOptedIn(t *testing.T) {
+	skipIfShortNetwork(t)
+
+	fx := startDialFallbackFixture(t, []byte{socksVersion, socksRepGeneralFailure, socksRSV, socksAtypIPv4})
+	fx.p.fallbackGeneralFailure = true
+	fx.assertDirectFallback(t)
+	if fx.p.backoff.shouldSkip(fx.p.upstream, time.Now()) {
+		t.Fatal("backoff cache must not be marked on CONNECT rep failure")
 	}
 }
 

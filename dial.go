@@ -20,11 +20,12 @@ const (
 // proxy holds the routing configuration and upstream backoff state shared by
 // the SOCKS5 and HTTP handlers.
 type proxy struct {
-	upstream          string
-	dialTimeout       time.Duration // TCP connect + SOCKS5 greeting to upstream
-	connectTimeout    time.Duration // SOCKS5 CONNECT reply from upstream
-	clientReadTimeout time.Duration // client greeting/request reads
-	backoff           *upstreamBackoffState
+	upstream               string
+	dialTimeout            time.Duration // TCP connect + SOCKS5 greeting to upstream
+	connectTimeout         time.Duration // SOCKS5 CONNECT reply from upstream
+	clientReadTimeout      time.Duration // client greeting/request reads
+	fallbackGeneralFailure bool          // opt-in direct fallback on CONNECT rep 0x01 (see dial)
+	backoff                *upstreamBackoffState
 }
 
 func (p *proxy) readTimeout() time.Duration {
@@ -75,7 +76,8 @@ func (s *upstreamBackoffState) clear(addr string) {
 }
 
 // dial tries the upstream SOCKS5 proxy first, falling back to a direct
-// connection only when the upstream is unreachable; any other failure is
+// connection only when the upstream is unreachable (or, with
+// fallbackGeneralFailure, on a 0x01 CONNECT reply); any other failure is
 // returned to the caller.
 // Canceling ctx unblocks the caller promptly. An in-flight upstream handshake
 // is not torn down on cancel: a cancel proves nothing about the upstream, so
@@ -123,9 +125,16 @@ func (p *proxy) dial(ctx context.Context, target socks5Target, creds *socks5Cred
 	if err == nil {
 		return conn, true, nil
 	}
-	if errors.As(err, new(upstreamConnectError)) {
+	var connectErr upstreamConnectError
+	if errors.As(err, &connectErr) {
 		// Any CONNECT reply proves the upstream is alive: relay its verdict
-		// instead of bypassing it.
+		// instead of bypassing it. The opt-in exception is general failure
+		// (0x01), which some upstreams use for transient internal errors —
+		// and others for policy denials, hence off by default.
+		if connectErr.rep == socksRepGeneralFailure && p.fallbackGeneralFailure {
+			log.Printf("upstream CONNECT failed (rep=0x%02x) for %s; falling back to direct", connectErr.rep, target.addr)
+			return dialDirect(ctx, target)
+		}
 		return nil, false, err
 	}
 	// errUpstreamAuth and errUpstreamProtocol land here: deliberate
